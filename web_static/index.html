@@ -1,0 +1,236 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>3D 标签人工微调</title>
+    <link rel="icon" href="data:," />
+    <link rel="stylesheet" href="/static/style.css" />
+  </head>
+  <body>
+    <aside class="sidebar">
+      <header class="brand">
+        <span>Manual Adjust App</span>
+        <h1>3D 标签人工微调</h1>
+      </header>
+
+      <section class="panel">
+        <h2>数据</h2>
+        <label>输入根目录
+          <input id="datasetRoot" type="text" spellcheck="false" />
+        </label>
+        <label>样本
+          <select id="sampleSelect"></select>
+        </label>
+        <button id="refreshSamples" class="secondary">刷新文件列表</button>
+        <label>Annotation JSON
+          <input id="annotationPath" type="text" spellcheck="false" readonly />
+        </label>
+        <label>OBJ-P 路径
+          <input id="objPath" type="text" spellcheck="false" readonly />
+        </label>
+      </section>
+
+      <section class="panel">
+        <h2>选择</h2>
+        <div class="target-toggle" role="group" aria-label="选择移动对象">
+          <label><input type="radio" name="targetKind" value="label" checked /> 标签</label>
+          <label><input type="radio" name="targetKind" value="anchor" /> 锚点</label>
+        </div>
+        <label>当前对象
+          <select id="targetSelect"></select>
+        </label>
+        <div class="label-meta">
+          <strong id="targetTitle">-</strong>
+          <span id="targetText">-</span>
+        </div>
+
+        <h3>主视角观察坐标</h3>
+        <div class="grid3">
+          <label>X <input id="camX" type="number" step="0.01" /></label>
+          <label>Y <input id="camY" type="number" step="0.01" /></label>
+          <label>Z <input id="camZ" type="number" step="0.01" /></label>
+        </div>
+
+        <h3>世界坐标</h3>
+        <div class="grid3">
+          <label>X <input id="worldX" type="number" readonly /></label>
+          <label>Y <input id="worldY" type="number" readonly /></label>
+          <label>Z <input id="worldZ" type="number" readonly /></label>
+        </div>
+
+        <h3>3D 标签框尺寸</h3>
+        <div class="grid3">
+          <label>宽 <input id="boxX" type="number" readonly /></label>
+          <label>高 <input id="boxY" type="number" readonly /></label>
+          <label>厚 <input id="boxZ" type="number" readonly /></label>
+        </div>
+      </section>
+
+      <section class="panel">
+        <h2>只读相机</h2>
+        <div class="grid2">
+          <label>半径 <input id="cameraRadius" type="number" readonly /></label>
+          <label>扰动角 <input id="perturbDegrees" type="number" readonly /></label>
+          <label>焦距 mm <input id="focalLength" type="number" readonly /></label>
+          <label>传感器宽 mm <input id="sensorWidth" type="number" readonly /></label>
+          <label>传感器高 mm <input id="sensorHeight" type="number" readonly /></label>
+          <label>近裁剪 <input id="nearClip" type="number" readonly /></label>
+          <label>远裁剪 <input id="farClip" type="number" readonly /></label>
+          <label>图片宽 <input id="imageWidth" type="number" readonly /></label>
+          <label>图片高 <input id="imageHeight" type="number" readonly /></label>
+        </div>
+      </section>
+    </aside>
+
+    <main class="workspace">
+      <header class="topbar">
+        <div class="topbar-info">
+          <span>Adaptive OBJ-O Projection Views</span>
+          <h2 id="sampleTitle">未加载</h2>
+          <p id="statusText" class="status">等待加载</p>
+        </div>
+        <div class="top-controls">
+          <div class="top-actions">
+            <button id="loadBtn" class="secondary">加载</button>
+            <button id="renderBtn" class="primary">生成投影</button>
+            <button id="saveBtn" class="secondary">保存完整结果</button>
+          </div>
+          <div class="output-grid">
+            <label>名字（必填）
+              <input id="editorName" type="text" spellcheck="false" placeholder="请输入名字" />
+            </label>
+            <label>输出根目录
+              <input id="outputRoot" type="text" spellcheck="false" />
+            </label>
+          </div>
+          <div class="move-toolbar">
+            <label>主视角坐标步长 <input id="stepSize" type="number" step="0.01" value="0.05" /></label>
+            <button data-axis="0" data-delta="1">+x</button>
+            <button data-axis="0" data-delta="-1">-x</button>
+            <button data-axis="1" data-delta="1">+y</button>
+            <button data-axis="1" data-delta="-1">-y</button>
+            <button data-axis="2" data-delta="1">+z</button>
+            <button data-axis="2" data-delta="-1">-z</button>
+          </div>
+          <div class="axis-sliders">
+            <label class="axis-slider">
+              <span class="axis-slider-label">-x</span>
+              <input id="sliderX" type="range" min="-20" max="20" step="1" value="0" data-axis="0" />
+              <span class="axis-slider-label">+x</span>
+            </label>
+            <label class="axis-slider">
+              <span class="axis-slider-label">-y</span>
+              <input id="sliderY" type="range" min="-20" max="20" step="1" value="0" data-axis="1" />
+              <span class="axis-slider-label">+y</span>
+            </label>
+            <label class="axis-slider">
+              <span class="axis-slider-label">-z</span>
+              <input id="sliderZ" type="range" min="-20" max="20" step="1" value="0" data-axis="2" />
+              <span class="axis-slider-label">+z</span>
+            </label>
+          </div>
+        </div>
+      </header>
+
+      <section class="views">
+        <article class="view-card obj-preview-card" data-view="obj-o">
+          <header class="obj-preview-header">
+            <span>obj-o</span>
+            <div class="obj-preview-controls">
+              <span id="objOUpdateHint" class="obj-update-hint hidden">已变化请更新</span>
+              <select id="objOSourceSelect" aria-label="OBJ-O 状态">
+                <option value="input">输入状态</option>
+                <option value="output">输出状态</option>
+                <option value="temp">微调中</option>
+              </select>
+              <select id="objOViewSelect" aria-label="OBJ-O view">
+                <option value="main">主视角</option>
+                <option value="up">上视角</option>
+                <option value="down">下视角</option>
+                <option value="left">左视角</option>
+                <option value="right">右视角</option>
+              </select>
+              <button id="resetObjOViewBtn" class="secondary" type="button">重置</button>
+            </div>
+          </header>
+          <div class="obj-viewer-shell">
+            <canvas id="objOCanvas" aria-label="OBJ-O 3D preview"></canvas>
+            <div id="objOEmpty" class="obj-viewer-empty">保存完整结果后可在这里查看 OBJ-O</div>
+          </div>
+        </article>
+
+        <article class="view-card" data-view="main">
+          <header>主视角</header>
+          <div class="projection-shell">
+            <div id="guideMain" class="axis-legend"></div>
+            <div class="image-frame">
+              <img id="imgMain" class="base-projection" alt="main projection" />
+              <img id="partMain" class="part-overlay-img" alt="" />
+              <svg id="overlayMain" class="move-overlay"></svg>
+            </div>
+          </div>
+        </article>
+
+        <article class="view-card" data-view="up">
+          <header>上视角</header>
+          <div class="projection-shell">
+            <div id="guideUp" class="axis-legend"></div>
+            <div class="image-frame">
+              <img id="imgUp" class="base-projection" alt="up projection" />
+              <img id="partUp" class="part-overlay-img" alt="" />
+              <svg id="overlayUp" class="move-overlay"></svg>
+            </div>
+          </div>
+        </article>
+
+        <article class="view-card" data-view="down">
+          <header>下视角</header>
+          <div class="projection-shell">
+            <div id="guideDown" class="axis-legend"></div>
+            <div class="image-frame">
+              <img id="imgDown" class="base-projection" alt="down projection" />
+              <img id="partDown" class="part-overlay-img" alt="" />
+              <svg id="overlayDown" class="move-overlay"></svg>
+            </div>
+          </div>
+        </article>
+
+        <article class="view-card" data-view="left">
+          <header>左视角</header>
+          <div class="projection-shell">
+            <div id="guideLeft" class="axis-legend"></div>
+            <div class="image-frame">
+              <img id="imgLeft" class="base-projection" alt="left projection" />
+              <img id="partLeft" class="part-overlay-img" alt="" />
+              <svg id="overlayLeft" class="move-overlay"></svg>
+            </div>
+          </div>
+        </article>
+
+        <article class="view-card" data-view="right">
+          <header>右视角</header>
+          <div class="projection-shell">
+            <div id="guideRight" class="axis-legend"></div>
+            <div class="image-frame">
+              <img id="imgRight" class="base-projection" alt="right projection" />
+              <img id="partRight" class="part-overlay-img" alt="" />
+              <svg id="overlayRight" class="move-overlay"></svg>
+            </div>
+          </div>
+        </article>
+      </section>
+    </main>
+
+    <script type="importmap">
+      {
+        "imports": {
+          "three": "https://unpkg.com/three@0.164.1/build/three.module.js",
+          "three/addons/": "https://unpkg.com/three@0.164.1/examples/jsm/"
+        }
+      }
+    </script>
+    <script type="module" src="/static/obj_o_viewer.js"></script>
+    <script src="/static/editor.js"></script>
+  </body>
+</html>

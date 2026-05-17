@@ -1,0 +1,1067 @@
+const appState = {
+  data: null,
+  samples: [],
+  selectedSample: null,
+  selectedIndex: 0,
+  selectedKind: "label",
+  objOView: "main",
+  dirty: false,
+  selectionRenderTimer: null,
+  anchorSnapTimer: null,
+  anchorSnapBusy: false,
+  anchorSnapPending: false,
+  objOSource: "input",
+  tempObjOStale: true,
+  baselineAnnotationPath: "",
+  targetBaselines: new Map(),
+};
+
+const viewIds = { main: "imgMain", up: "imgUp", down: "imgDown", left: "imgLeft", right: "imgRight" };
+const partIds = { main: "partMain", up: "partUp", down: "partDown", left: "partLeft", right: "partRight" };
+const guideIds = { main: "guideMain", up: "guideUp", down: "guideDown", left: "guideLeft", right: "guideRight" };
+const overlayIds = { main: "overlayMain", up: "overlayUp", down: "overlayDown", left: "overlayLeft", right: "overlayRight" };
+const axisInputs = ["camX", "camY", "camZ"];
+const sliderIds = ["sliderX", "sliderY", "sliderZ"];
+const axisNames = ["x", "y", "z"];
+const axisColors = { "+x": "#d94733", "+y": "#2368b8", "+z": "#218354" };
+const manualOutputSuffix = "\uff08\u5df2\u6709\u5fae\u8c03\uff09";
+const minVisibleMove = 0.12;
+const moveTraceMinDistance = 1e-4;
+const objOSourceLabels = { input: "输入状态", output: "输出状态", temp: "微调中" };
+const viewLabels = { main: "主视角", up: "上视角", down: "下视角", left: "左视角", right: "右视角" };
+
+const $ = (id) => document.getElementById(id);
+
+function sampleOptionText(sample) {
+  return `${sample.display_name || sample.name}${sample.manual_output_complete ? manualOutputSuffix : ""}`;
+}
+
+function refreshSampleOption(sample) {
+  const sampleSelect = $("sampleSelect");
+  if (!sampleSelect || !sample) return;
+  for (const option of sampleSelect.options) {
+    if (option.value === sample.annotation_path) {
+      option.textContent = sampleOptionText(sample);
+      return;
+    }
+  }
+}
+
+function placeActionButtons() {
+  const actions = document.querySelector(".top-actions");
+  const status = $("statusText");
+  if (actions && status?.parentNode && actions.parentNode !== status.parentNode) {
+    status.parentNode.insertBefore(actions, status);
+  }
+}
+
+function fileUrl(path) {
+  return `/api/file?path=${encodeURIComponent(path)}&t=${Date.now()}`;
+}
+
+async function getJson(url) {
+  const response = await fetch(url);
+  const text = await response.text();
+  if (!response.ok) throw new Error(text);
+  return JSON.parse(text);
+}
+
+async function postJson(url, payload) {
+  const response = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  const text = await response.text();
+  if (!response.ok) throw new Error(text);
+  const data = JSON.parse(text);
+  if (data.error) throw new Error(data.error);
+  return data;
+}
+
+function setStatus(message, isError = false) {
+  const node = $("statusText");
+  node.textContent = message;
+  node.classList.toggle("error", Boolean(isError));
+}
+
+function showToast(message, isError = false, duration = 1800) {
+  let node = $("toastNotice");
+  if (!node) {
+    node = document.createElement("div");
+    node.id = "toastNotice";
+    node.className = "toast-notice";
+    document.body.appendChild(node);
+  }
+  node.textContent = message;
+  node.classList.toggle("error", Boolean(isError));
+  node.classList.add("show");
+  window.clearTimeout(node.dataset.timerId ? Number(node.dataset.timerId) : 0);
+  delete node.dataset.timerId;
+  if (duration !== null && Number(duration) > 0) {
+    const timerId = window.setTimeout(() => node.classList.remove("show"), Number(duration));
+    node.dataset.timerId = String(timerId);
+  }
+}
+
+function showStageToast(message) {
+  showToast(message, false, null);
+}
+
+function finishStageToast(message, isError = false) {
+  showToast(message, isError, isError ? 3200 : 1400);
+}
+
+function numberValue(id) {
+  const value = Number($(id).value);
+  if (!Number.isFinite(value)) throw new Error(`${id} 不是有效数字`);
+  return value;
+}
+
+function setNumber(id, value, digits = 6) {
+  if (value === undefined || value === null || Number.isNaN(Number(value))) {
+    $(id).value = "";
+    return;
+  }
+  let text = Number(value).toFixed(digits);
+  if (text.includes(".")) text = text.replace(/0+$/, "").replace(/\.$/, "");
+  $(id).value = text;
+}
+
+function dot(a, b) {
+  return a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+}
+
+function add(a, b) {
+  return [a[0] + b[0], a[1] + b[1], a[2] + b[2]];
+}
+
+function scale(a, k) {
+  return [a[0] * k, a[1] * k, a[2] * k];
+}
+
+function worldToCamera(point, camera) {
+  const delta = [point[0] - camera.position[0], point[1] - camera.position[1], point[2] - camera.position[2]];
+  return [dot(delta, camera.x_view), dot(delta, camera.y_view), dot(delta, camera.z_view)];
+}
+
+function cameraToWorld(coords, camera) {
+  return add(add(add(camera.position, scale(camera.x_view, coords[0])), scale(camera.y_view, coords[1])), scale(camera.z_view, coords[2]));
+}
+
+function projectWorldToPixels(point, camera, width, height) {
+  const cameraPoint = worldToCamera(point, camera);
+  const depth = -cameraPoint[2];
+  if (depth <= 1e-9) return null;
+  const focal = Number(camera.focal_length_mm);
+  const halfSensorWidth = Number(camera.sensor_width_mm) * 0.5;
+  const halfSensorHeight = Number(camera.sensor_height_mm) * 0.5;
+  const ndcX = (cameraPoint[0] * focal) / (depth * halfSensorWidth);
+  const ndcY = (cameraPoint[1] * focal) / (depth * halfSensorHeight);
+  return [(ndcX + 1.0) * 0.5 * (width - 1), (1.0 - (ndcY + 1.0) * 0.5) * (height - 1)];
+}
+
+function labelBoxCorners(group, camera) {
+  const center = group?.label_world_center;
+  const size = group?.box_size;
+  if (!center || !size || size.length < 3) return [];
+  const half = [Number(size[0]) * 0.5, Number(size[1]) * 0.5, Number(size[2]) * 0.5];
+  const corners = [];
+  for (const sx of [-1, 1]) {
+    for (const sy of [-1, 1]) {
+      for (const sz of [-1, 1]) {
+        corners.push(add(add(add(center, scale(camera.x_view, sx * half[0])), scale(camera.y_view, sy * half[1])), scale(camera.z_view, sz * half[2])));
+      }
+    }
+  }
+  return corners;
+}
+
+function projectedLabelBounds(group, camera, width, height) {
+  const points = labelBoxCorners(group, camera)
+    .map((point) => projectWorldToPixels(point, camera, width, height))
+    .filter(Boolean);
+  if (!points.length) return null;
+  const xs = points.map((point) => point[0]);
+  const ys = points.map((point) => point[1]);
+  return {
+    left: Math.max(0, Math.min(...xs)),
+    top: Math.max(0, Math.min(...ys)),
+    right: Math.min(width, Math.max(...xs)),
+    bottom: Math.min(height, Math.max(...ys)),
+  };
+}
+
+function markDirty(positionChanged = true) {
+  appState.dirty = true;
+  if (positionChanged) {
+    appState.tempObjOStale = true;
+    setStatus("已记录当前位置；切换标签/锚点不会生成投影，点击“生成投影”后再更新投影和微调中 OBJ-O。");
+    renderViewGuides();
+    updateObjOSourceSelect(appState.data);
+    if (selectedObjOSource() === "temp") {
+      refreshObjOPreview(appState.data, true);
+    }
+  } else {
+    setStatus("已记录页面信息。");
+  }
+}
+
+function currentGroup() {
+  return appState.data?.groups?.[appState.selectedIndex] || null;
+}
+
+function targetKey(index = appState.selectedIndex, kind = appState.selectedKind) {
+  return `${kind}:${index}`;
+}
+
+function clonePoint(point) {
+  return Array.isArray(point) ? point.map(Number) : null;
+}
+
+function captureTargetBaselines(data, force = false) {
+  if (!data?.loaded) return;
+  if (!force && appState.baselineAnnotationPath === data.annotation_path && appState.targetBaselines.size) return;
+  appState.baselineAnnotationPath = data.annotation_path || "";
+  appState.targetBaselines = new Map();
+  (data.groups || []).forEach((group, index) => {
+    appState.targetBaselines.set(targetKey(index, "label"), clonePoint(group.label_world_center));
+    appState.targetBaselines.set(targetKey(index, "anchor"), clonePoint(group.anchor_world));
+  });
+}
+
+function baselineWorldFor(index = appState.selectedIndex, kind = appState.selectedKind) {
+  return appState.targetBaselines.get(targetKey(index, kind)) || null;
+}
+
+function distance3(a, b) {
+  if (!a || !b) return 0;
+  return Math.hypot(Number(a[0]) - Number(b[0]), Number(a[1]) - Number(b[1]), Number(a[2]) - Number(b[2]));
+}
+
+function hasMeaningfulMove(a, b) {
+  return distance3(a, b) > moveTraceMinDistance;
+}
+
+function currentTargetCamera(group = currentGroup()) {
+  if (!group) return null;
+  return appState.selectedKind === "anchor" ? group.anchor_camera_center : group.label_camera_center;
+}
+
+function currentTargetWorld(group = currentGroup()) {
+  if (!group) return null;
+  return appState.selectedKind === "anchor" ? group.anchor_world : group.label_world_center;
+}
+
+function displayTargetId(index = appState.selectedIndex, kind = appState.selectedKind) {
+  return `${kind === "anchor" ? "anchor" : "label"}_${index + 1}`;
+}
+
+function setCurrentTargetCamera(group, cameraCenter) {
+  const mainCamera = appState.data?.view_cameras?.main;
+  if (!group || !mainCamera) return;
+  const worldCenter = cameraToWorld(cameraCenter.map(Number), mainCamera);
+  if (appState.selectedKind === "anchor") {
+    group.anchor_camera_center = cameraCenter;
+    group.anchor_world = worldCenter;
+  } else {
+    group.label_camera_center = cameraCenter;
+    group.label_world_center = worldCenter;
+  }
+}
+
+function syncSelectedFromInputs() {
+  const group = currentGroup();
+  if (!group) return;
+  const coords = [numberValue("camX"), numberValue("camY"), numberValue("camZ")];
+  setCurrentTargetCamera(group, coords);
+  const world = currentTargetWorld(group);
+  setNumber("worldX", world?.[0], 6);
+  setNumber("worldY", world?.[1], 6);
+  setNumber("worldZ", world?.[2], 6);
+}
+
+function refreshStateAfterAnchorSnap(data) {
+  if (!data?.loaded || !appState.data) return;
+  appState.data.groups = data.groups || appState.data.groups;
+  appState.data.camera = data.camera || appState.data.camera;
+  appState.data.view_cameras = data.view_cameras || appState.data.view_cameras;
+  appState.data.text_objs_available = data.text_objs_available;
+  appState.data.text_objs_dir = data.text_objs_dir;
+  appState.data.missing_text_objs = data.missing_text_objs || [];
+  renderTargetSelector();
+  renderSelectedTarget();
+  updateSaveButtons(appState.data);
+}
+
+function describeSnapReport(report) {
+  if (!report?.snapped) return "";
+  const distance = Number(report.distance || 0).toFixed(4);
+  return `${displayTargetId(report.index, "anchor")} 已偏离目标部件，已吸附到最近表面，距离 ${distance}`;
+}
+
+function scheduleAnchorSnap(delay = 120) {
+  if (!appState.data?.loaded || appState.selectedKind !== "anchor") return;
+  window.clearTimeout(appState.anchorSnapTimer);
+  appState.anchorSnapTimer = window.setTimeout(runAnchorSnap, delay);
+}
+
+async function runAnchorSnap() {
+  if (!appState.data?.loaded || appState.selectedKind !== "anchor") return;
+  if (appState.anchorSnapBusy) {
+    appState.anchorSnapPending = true;
+    return;
+  }
+  appState.anchorSnapBusy = true;
+  appState.anchorSnapPending = false;
+  const index = appState.selectedIndex;
+  try {
+    const payload = payloadFromState();
+    payload.index = index;
+    const data = await postJson("/api/snap_anchor", payload);
+    if (appState.selectedKind === "anchor" && appState.selectedIndex === index) {
+      refreshStateAfterAnchorSnap(data);
+    } else if (data?.loaded && appState.data) {
+      appState.data.groups = data.groups || appState.data.groups;
+    }
+    const message = describeSnapReport(data.anchor_snap_report);
+    if (message) showToast(message);
+  } catch (error) {
+    showToast(error.message || String(error), true);
+  } finally {
+    appState.anchorSnapBusy = false;
+    if (appState.anchorSnapPending) scheduleAnchorSnap(80);
+  }
+}
+
+function resetMoveSliders() {
+  sliderIds.forEach((id, axis) => {
+    const slider = $(id);
+    if (!slider) return;
+    slider.value = "0";
+    slider.dataset.base = String(Number($(axisInputs[axis]).value || 0));
+  });
+}
+
+function primeMoveSlider(slider) {
+  const axis = Number(slider.dataset.axis);
+  slider.dataset.base = String(Number($(axisInputs[axis]).value || 0));
+}
+
+function applyMoveSlider(slider) {
+  const axis = Number(slider.dataset.axis);
+  if (!slider.dataset.base) primeMoveSlider(slider);
+  const base = Number(slider.dataset.base || 0);
+  const step = numberValue("stepSize");
+  const next = base + Number(slider.value || 0) * step;
+  $(axisInputs[axis]).value = next.toFixed(6);
+  syncSelectedFromInputs();
+  markDirty();
+  scheduleAnchorSnap();
+}
+
+function finishMoveSlider(slider) {
+  const axis = Number(slider.dataset.axis);
+  slider.dataset.base = String(Number($(axisInputs[axis]).value || 0));
+  slider.value = "0";
+}
+
+function editorNameValue() {
+  return $("editorName")?.value.trim() || "";
+}
+
+function selectedObjOView() {
+  return $("objOViewSelect")?.value || appState.objOView || "main";
+}
+
+function selectedObjOSource() {
+  return $("objOSourceSelect")?.value || appState.objOSource || "input";
+}
+
+function objOInfoForSource(data, source = selectedObjOSource()) {
+  return data?.obj_o_sources?.[source] || null;
+}
+
+function updateObjOUpdateHint() {
+  const hint = $("objOUpdateHint");
+  if (!hint) return;
+  hint.classList.toggle("hidden", !(selectedObjOSource() === "temp" && appState.tempObjOStale));
+}
+
+function updateObjOSourceSelect(data) {
+  const select = $("objOSourceSelect");
+  if (!select) return;
+  const previous = selectedObjOSource();
+  for (const option of select.options) {
+    const info = objOInfoForSource(data, option.value);
+    const suffix = data?.loaded && !info?.exists ? "（无）" : "";
+    option.textContent = `${objOSourceLabels[option.value] || option.value}${suffix}`;
+  }
+  if ([...select.options].some((option) => option.value === previous)) {
+    select.value = previous;
+  } else {
+    select.value = data?.obj_o_default_source || "input";
+  }
+  appState.objOSource = select.value;
+  updateObjOUpdateHint();
+}
+
+function updateObjOViewSelect(data) {
+  const select = $("objOViewSelect");
+  if (!select) return;
+  const previous = selectedObjOView();
+  const info = objOInfoForSource(data);
+  const available = info?.exists_by_view || {};
+  for (const option of select.options) {
+    option.textContent = viewLabels[option.value] || option.value;
+    option.disabled = Boolean(data?.loaded) && available[option.value] === false && !info?.paths?.[option.value];
+  }
+  select.disabled = Boolean(data?.loaded) && !info?.exists;
+  const next = available[previous] === false && !info?.paths?.[previous] ? "main" : previous;
+  select.value = next;
+  appState.objOView = next;
+}
+
+function renderExistingOutputNotice(data) {
+  const title = $("sampleTitle");
+  const hasManualOutput = Boolean(data?.manual_output_complete);
+  title?.classList.toggle("manual-output-ready", hasManualOutput);
+  if (title) {
+    title.title = hasManualOutput ? "输出目录中已有人工微调后的完整结果" : "";
+  }
+}
+
+function requireEditorName(actionLabel = "保存") {
+  if (editorNameValue()) return true;
+  $("editorName")?.focus();
+  updateSaveButtons(appState.data);
+  setStatus(`请先输入名字，再${actionLabel}。`, true);
+  return false;
+}
+
+function outputPayload() {
+  return { output_root: $("outputRoot").value.trim() };
+}
+
+function payloadFromState() {
+  syncSelectedFromInputs();
+  return {
+    editor_name: editorNameValue(),
+    output: outputPayload(),
+    groups: (appState.data?.groups || []).map((group) => ({
+      index: group.index,
+      label_camera_center: group.label_camera_center.map(Number),
+      anchor_camera_center: group.anchor_camera_center.map(Number),
+    })),
+  };
+}
+
+async function refreshSamples(options = {}) {
+  showStageToast("正在刷新文件列表...");
+  try {
+    const root = $("datasetRoot").value.trim();
+    const outputRoot = $("outputRoot").value.trim();
+    const data = await getJson(`/api/samples?root=${encodeURIComponent(root)}&output_root=${encodeURIComponent(outputRoot)}`);
+    appState.samples = data.samples || [];
+    const sampleSelect = $("sampleSelect");
+    sampleSelect.innerHTML = "";
+    for (const sample of appState.samples) {
+      const option = document.createElement("option");
+      option.value = sample.annotation_path;
+      option.textContent = sampleOptionText(sample);
+      sampleSelect.appendChild(option);
+    }
+    if (appState.samples.length) {
+      const firstOpen = appState.samples.find((sample) => !sample.manual_output_complete) || appState.samples[0];
+      selectSample(firstOpen.annotation_path);
+      finishStageToast("文件列表刷新完成");
+      if (options.autoLoad) {
+        await loadAnnotation();
+      }
+    } else {
+      appState.selectedSample = null;
+      $("sampleTitle").textContent = "未找到样本";
+      setStatus("输入根目录下没有找到 Annotation JSON。", true);
+      finishStageToast("没有找到可加载的样本", true);
+    }
+  } catch (error) {
+    finishStageToast(error.message || String(error), true);
+    setStatus(error.message || String(error), true);
+  }
+}
+
+async function refreshSamplesPreservingCurrent(preferredAnnotationPath) {
+  const root = $("datasetRoot").value.trim();
+  const outputRoot = $("outputRoot").value.trim();
+  const data = await getJson(`/api/samples?root=${encodeURIComponent(root)}&output_root=${encodeURIComponent(outputRoot)}`);
+  appState.samples = data.samples || [];
+  const sampleSelect = $("sampleSelect");
+  sampleSelect.innerHTML = "";
+  for (const sample of appState.samples) {
+    const option = document.createElement("option");
+    option.value = sample.annotation_path;
+    option.textContent = sampleOptionText(sample);
+    sampleSelect.appendChild(option);
+  }
+  const matched = appState.samples.find((item) => item.annotation_path === preferredAnnotationPath);
+  if (matched) {
+    appState.selectedSample = matched;
+    sampleSelect.value = matched.annotation_path;
+    $("annotationPath").value = matched.annotation_path || "";
+    $("objPath").value = matched.obj_p_path || "";
+  }
+}
+
+function selectSample(annotationPath) {
+  appState.selectedSample = appState.samples.find((item) => item.annotation_path === annotationPath) || null;
+  if (!appState.selectedSample) return;
+  $("sampleSelect").value = annotationPath;
+  $("annotationPath").value = appState.selectedSample.annotation_path || "";
+  $("objPath").value = appState.selectedSample.obj_p_path || "";
+  const currentOutput = $("outputRoot").value.trim();
+  if (!currentOutput) {
+    $("outputRoot").value = appState.data?.output_root || "";
+  }
+  $("sampleTitle").textContent = appState.selectedSample.display_name || appState.selectedSample.name;
+  setStatus("已选择样本，点击“加载”。");
+}
+
+function renderCamera(camera) {
+  if (!camera) return;
+  setNumber("cameraRadius", camera.camera_radius, 4);
+  setNumber("focalLength", camera.focal_length_mm, 4);
+  setNumber("sensorWidth", camera.sensor_width_mm, 4);
+  setNumber("sensorHeight", camera.sensor_height_mm, 4);
+  setNumber("nearClip", camera.near_clip, 8);
+  setNumber("farClip", camera.far_clip, 2);
+  setNumber("perturbDegrees", camera.perturb_degrees ?? 45, 4);
+  setNumber("imageWidth", camera.projection_image_width, 0);
+  setNumber("imageHeight", camera.projection_image_height, 0);
+}
+
+function renderTargetSelector() {
+  const groups = appState.data?.groups || [];
+  const select = $("targetSelect");
+  select.innerHTML = "";
+  groups.forEach((group, index) => {
+    const option = document.createElement("option");
+    option.value = String(index);
+    option.textContent = `${displayTargetId(index, appState.selectedKind)} | ${group.group_id}`;
+    select.appendChild(option);
+  });
+  if (groups.length && appState.selectedIndex >= groups.length) appState.selectedIndex = groups.length - 1;
+  select.value = String(appState.selectedIndex);
+}
+
+function renderSelectedTarget() {
+  const group = currentGroup();
+  if (!group) {
+    $("targetTitle").textContent = "-";
+    $("targetText").textContent = "-";
+    return;
+  }
+  $("targetTitle").textContent = `${displayTargetId(appState.selectedIndex, appState.selectedKind)} | ${group.group_id}`;
+  $("targetText").textContent = group.text || group.group_id;
+  const camera = currentTargetCamera(group);
+  const world = currentTargetWorld(group);
+  setNumber("camX", camera?.[0], 6);
+  setNumber("camY", camera?.[1], 6);
+  setNumber("camZ", camera?.[2], 6);
+  setNumber("worldX", world?.[0], 6);
+  setNumber("worldY", world?.[1], 6);
+  setNumber("worldZ", world?.[2], 6);
+  setNumber("boxX", group.box_size?.[0], 6);
+  setNumber("boxY", group.box_size?.[1], 6);
+  setNumber("boxZ", group.box_size?.[2], 6);
+  resetMoveSliders();
+  renderViewGuides();
+}
+
+function renderImages(images, partImages) {
+  for (const [view, id] of Object.entries(viewIds)) {
+    const img = $(id);
+    if (images?.[view]) img.src = fileUrl(images[view]);
+    else img.removeAttribute("src");
+  }
+  for (const [view, id] of Object.entries(partIds)) {
+    const img = $(id);
+    if (partImages?.[view]) img.src = fileUrl(partImages[view]);
+    else img.removeAttribute("src");
+  }
+}
+
+function bestMove(candidates, direction) {
+  const score = {
+    right: (item) => item.dx,
+    left: (item) => -item.dx,
+    up: (item) => -item.dy,
+    down: (item) => item.dy,
+  }[direction];
+  return candidates.reduce((best, item) => (score(item) > score(best) ? item : best), candidates[0]);
+}
+
+function movementCandidates(viewCamera, baseWorld, step, width, height) {
+  const mainCamera = appState.data?.view_cameras?.main;
+  if (!mainCamera) return [];
+  const basePixel = projectWorldToPixels(baseWorld, viewCamera, width, height);
+  if (!basePixel) return [];
+
+  const result = [];
+  for (let axis = 0; axis < 3; axis += 1) {
+    const axisVector = [mainCamera.x_view, mainCamera.y_view, mainCamera.z_view][axis];
+    for (const sign of [1, -1]) {
+      const movedWorld = add(baseWorld, scale(axisVector, step * sign));
+      const movedPixel = projectWorldToPixels(movedWorld, viewCamera, width, height);
+      if (!movedPixel) continue;
+      const dx = movedPixel[0] - basePixel[0];
+      const dy = movedPixel[1] - basePixel[1];
+      result.push({ label: `${sign > 0 ? "+" : "-"}${axisNames[axis]}`, dx, dy, length: Math.hypot(dx, dy), basePixel });
+    }
+  }
+  return result;
+}
+
+function renderSideCompass(node, candidates, positiveAxes, step) {
+  const visibleCandidates = candidates.filter((item) => item.length >= minVisibleMove);
+  const visiblePositiveAxes = positiveAxes.filter((item) => item.length >= minVisibleMove);
+  if (!visibleCandidates.length || !visiblePositiveAxes.length) {
+    node.innerHTML = `<div class="legend-title">步长 ${step}</div><div class="legend-text">该视角下移动趋势太小。</div>`;
+    return;
+  }
+
+  const right = bestMove(visibleCandidates, "right");
+  const left = bestMove(visibleCandidates, "left");
+  const up = bestMove(visibleCandidates, "up");
+  const down = bestMove(visibleCandidates, "down");
+  const centerX = 54;
+  const centerY = 46;
+  const compass = visiblePositiveAxes
+    .map((item, index) => {
+      const color = axisColors[item.label] || "#222";
+      const length = Math.max(item.length, 0.001);
+      const displayLength = 22 + index * 2;
+      const unitX = item.dx / length;
+      const unitY = item.dy / length;
+      const x2 = centerX + unitX * displayLength;
+      const y2 = centerY + unitY * displayLength;
+      const textX = Math.min(Math.max(x2 + unitX * 7 - 10, 2), 86);
+      const textY = Math.min(Math.max(y2 + unitY * 7 + 4, 12), 88);
+      return `<line x1="${centerX}" y1="${centerY}" x2="${x2}" y2="${y2}" stroke="${color}" stroke-width="2" stroke-linecap="round" />
+              <circle cx="${x2}" cy="${y2}" r="2.4" fill="${color}" />
+              <text x="${textX}" y="${textY}" fill="${color}" font-size="12" font-weight="900">${item.label}</text>`;
+    })
+    .join("");
+
+  const scaleLines = visiblePositiveAxes
+    .map((item) => {
+      const color = axisColors[item.label] || "#222";
+      const y = item.label === "+x" ? 16 : item.label === "+y" ? 38 : 60;
+      const len = Math.min(76, Math.max(5, item.length));
+      return `<line x1="16" y1="${y}" x2="${16 + len}" y2="${y}" stroke="${color}" stroke-width="4" stroke-linecap="round" />
+              <text x="16" y="${y - 7}" fill="${color}" font-size="11" font-weight="900">${item.label}</text>`;
+    })
+    .join("");
+
+  node.innerHTML = `
+    <div class="legend-title">步长 ${step}</div>
+    <svg class="legend-compass" viewBox="0 0 108 92">
+      <circle cx="${centerX}" cy="${centerY}" r="3" fill="#111" />
+      ${compass}
+    </svg>
+    <div class="legend-title small">线段长度表示一步在图中的位移</div>
+    <svg class="legend-scale" viewBox="0 0 108 72">${scaleLines}</svg>
+    <div class="legend-text">向右: ${right.label}<br />向左: ${left.label}<br />向上: ${up.label}<br />向下: ${down.label}</div>
+  `;
+}
+
+function markerMarkup(x, y, color, label, style = "solid") {
+  const dash = style === "dashed" ? ' stroke-dasharray="5 4"' : "";
+  const opacity = style === "dashed" ? ' opacity="0.82"' : "";
+  return `
+    <g${opacity}>
+      <circle cx="${x}" cy="${y}" r="7" fill="none" stroke="${color}" stroke-width="3"${dash} />
+      <line x1="${x - 11}" y1="${y}" x2="${x + 11}" y2="${y}" stroke="${color}" stroke-width="2" />
+      <line x1="${x}" y1="${y - 11}" x2="${x}" y2="${y + 11}" stroke="${color}" stroke-width="2" />
+      <text x="${x + 12}" y="${Math.max(18, y - 10)}" fill="${color}" font-size="15" font-weight="900">${label}</text>
+    </g>
+  `;
+}
+
+function movedTargetEntries() {
+  const entries = [];
+  const groups = appState.data?.groups || [];
+  groups.forEach((group, index) => {
+    for (const kind of ["label", "anchor"]) {
+      const startWorld = baselineWorldFor(index, kind);
+      const endWorld = kind === "anchor" ? group.anchor_world : group.label_world_center;
+      if (startWorld && endWorld && hasMeaningfulMove(startWorld, endWorld)) {
+        entries.push({ index, kind, group, startWorld, endWorld });
+      }
+    }
+  });
+  return entries;
+}
+
+function movedTargetOverlayMarkup(entry, viewCamera, width, height, options = {}) {
+  const startPoint = projectWorldToPixels(entry.startWorld, viewCamera, width, height);
+  const endPoint = projectWorldToPixels(entry.endWorld, viewCamera, width, height);
+  if (!startPoint || !endPoint) return "";
+  const moveColor = "#15803d";
+  const sx = Math.max(0, Math.min(width, startPoint[0]));
+  const sy = Math.max(0, Math.min(height, startPoint[1]));
+  const ex = Math.max(0, Math.min(width, endPoint[0]));
+  const ey = Math.max(0, Math.min(height, endPoint[1]));
+  const targetLabel = displayTargetId(entry.index, entry.kind);
+  const startLabel = `${targetLabel} 起点`;
+  const endLabel = `${targetLabel} 终点`;
+  let boxMarkup = "";
+  if (entry.kind === "label") {
+    const bounds = projectedLabelBounds(entry.group, viewCamera, width, height);
+    if (bounds) {
+      const boxWidth = Math.max(1, bounds.right - bounds.left);
+      const boxHeight = Math.max(1, bounds.bottom - bounds.top);
+      boxMarkup = `<rect x="${bounds.left}" y="${bounds.top}" width="${boxWidth}" height="${boxHeight}" fill="rgba(21, 128, 61, 0.08)" stroke="${moveColor}" stroke-width="${options.current ? 3 : 2}" stroke-dasharray="10 6" />`;
+    }
+  }
+  return `
+    ${boxMarkup}
+    ${markerMarkup(sx, sy, moveColor, startLabel, "dashed")}
+    ${markerMarkup(ex, ey, moveColor, endLabel, "solid")}
+  `;
+}
+
+function renderSelectionMarker(svg, viewCamera, targetWorld, width, height, group) {
+  svg.setAttribute("viewBox", `0 0 ${width} ${height}`);
+  svg.setAttribute("preserveAspectRatio", "none");
+  const point = projectWorldToPixels(targetWorld, viewCamera, width, height);
+  if (!point) {
+    svg.innerHTML = movedTargetEntries()
+      .map((entry) => movedTargetOverlayMarkup(entry, viewCamera, width, height))
+      .join("");
+    return;
+  }
+  const color = appState.selectedKind === "anchor" ? "#ff2f2f" : "#1f57ff";
+  const label = displayTargetId(appState.selectedIndex, appState.selectedKind);
+  const x = Math.max(0, Math.min(width, point[0]));
+  const y = Math.max(0, Math.min(height, point[1]));
+  const textX = Math.min(x + 12, width - 110);
+  const textY = Math.max(18, y - 10);
+  const startWorld = baselineWorldFor(appState.selectedIndex, appState.selectedKind);
+  const startPoint = startWorld ? projectWorldToPixels(startWorld, viewCamera, width, height) : null;
+  const hasMoved = Boolean(startPoint && hasMeaningfulMove(startWorld, targetWorld));
+  const currentKey = targetKey(appState.selectedIndex, appState.selectedKind);
+  const movedMarkup = movedTargetEntries()
+    .filter((entry) => targetKey(entry.index, entry.kind) !== currentKey)
+    .map((entry) => movedTargetOverlayMarkup(entry, viewCamera, width, height))
+    .join("");
+  let boxMarkup = "";
+  if (appState.selectedKind === "label") {
+    const bounds = projectedLabelBounds(group, viewCamera, width, height);
+    if (bounds) {
+      const boxWidth = Math.max(1, bounds.right - bounds.left);
+      const boxHeight = Math.max(1, bounds.bottom - bounds.top);
+      const boxColor = hasMoved ? "#15803d" : color;
+      const boxFill = hasMoved ? "rgba(21, 128, 61, 0.08)" : "rgba(31, 87, 255, 0.08)";
+      boxMarkup = `
+        <rect x="${bounds.left}" y="${bounds.top}" width="${boxWidth}" height="${boxHeight}" fill="${boxFill}" stroke="${boxColor}" stroke-width="3" stroke-dasharray="10 6" />
+      `;
+    }
+  }
+  if (hasMoved) {
+    const currentMovedMarkup = movedTargetOverlayMarkup(
+      {
+        index: appState.selectedIndex,
+        kind: appState.selectedKind,
+        group,
+        startWorld,
+        endWorld: targetWorld,
+      },
+      viewCamera,
+      width,
+      height,
+      { current: true },
+    );
+    svg.innerHTML = `
+      ${movedMarkup}
+      ${currentMovedMarkup}
+    `;
+    return;
+  }
+  svg.innerHTML = `
+    ${movedMarkup}
+    ${boxMarkup}
+    <circle cx="${x}" cy="${y}" r="7" fill="none" stroke="${color}" stroke-width="3" />
+    <line x1="${x - 11}" y1="${y}" x2="${x + 11}" y2="${y}" stroke="${color}" stroke-width="2" />
+    <line x1="${x}" y1="${y - 11}" x2="${x}" y2="${y + 11}" stroke="${color}" stroke-width="2" />
+    <text x="${textX}" y="${textY}" fill="${color}" font-size="16" font-weight="900">${label}</text>
+  `;
+}
+
+function renderViewGuides() {
+  const group = currentGroup();
+  const cameras = appState.data?.view_cameras;
+  if (!group || !cameras) return;
+  const step = Number($("stepSize").value || 0);
+  const width = Number($("imageWidth").value || 750);
+  const height = Number($("imageHeight").value || 500);
+  const baseWorld = currentTargetWorld(group);
+
+  for (const view of Object.keys(guideIds)) {
+    const node = $(guideIds[view]);
+    const svg = $(overlayIds[view]);
+    if (svg) svg.dataset.view = view;
+    const camera = cameras[view];
+    if (!node || !svg || !camera || !baseWorld || !Number.isFinite(step) || step <= 0) {
+      if (node) node.textContent = "暂无移动提示";
+      if (svg) svg.innerHTML = "";
+      continue;
+    }
+    const candidates = movementCandidates(camera, baseWorld, step, width, height);
+    if (!candidates.length) {
+      node.textContent = "当前对象在该视角后方，无法估算。";
+      svg.innerHTML = "";
+      continue;
+    }
+    renderSideCompass(node, candidates, candidates.filter((item) => item.label.startsWith("+")), step);
+    renderSelectionMarker(svg, camera, baseWorld, width, height, group);
+  }
+}
+
+function renderState(data, options = {}) {
+  appState.data = data;
+  if (!data.loaded) {
+    refreshObjOPreview(data, Boolean(options.forceObjPreview));
+    renderExistingOutputNotice(data);
+    setStatus("还没有加载 JSON。", true);
+    return;
+  }
+  captureTargetBaselines(data);
+
+  $("datasetRoot").value = data.dataset_root || $("datasetRoot").value;
+  if (data.annotation_path && $("sampleSelect")) {
+    const matched = appState.samples.find((item) => item.annotation_path === data.annotation_path);
+    if (matched) {
+      matched.manual_output_complete = Boolean(data.manual_output_complete);
+      matched.manual_output_layout_dir = data.manual_output_info?.layout_dir || matched.manual_output_layout_dir;
+      appState.selectedSample = matched;
+      refreshSampleOption(matched);
+      $("sampleSelect").value = data.annotation_path;
+    }
+  }
+  const stateOutput = data.output_root || $("outputRoot").value || data.dataset_root || "";
+  $("outputRoot").value = stateOutput;
+  $("annotationPath").value = data.annotation_path || "";
+  $("objPath").value = data.obj_p_path || "";
+  $("sampleTitle").textContent = data.annotation_path?.split(/[\\/]/).slice(-3).join(" / ") || "已加载";
+  renderCamera(data.camera);
+  renderTargetSelector();
+  renderSelectedTarget();
+  renderImages(data.projection_images, data.part_overlay_images);
+  updateObjOSourceSelect(data);
+  updateObjOViewSelect(data);
+  renderExistingOutputNotice(data);
+  updateSaveButtons(data);
+  refreshObjOPreview(data, Boolean(options.forceObjPreview));
+  appState.dirty = false;
+  setStatus("已加载。移动会先记录在页面内存中；需要检查时点击“生成投影”，点击“保存完整结果”会写入 Annotation、Mutiviews 和 Obj-O。");
+}
+
+function selectTarget(index) {
+  syncSelectedFromInputs();
+  appState.selectedIndex = Number(index);
+  renderTargetSelector();
+  renderSelectedTarget();
+  setStatus("已切换对象；移动会记录在页面中，点击“生成投影”后再更新投影。");
+}
+
+function refreshObjOPreview(data, force = false) {
+  const source = selectedObjOSource();
+  const view = selectedObjOView();
+  appState.objOSource = source;
+  appState.objOView = view;
+  if (!window.loadObjOPreview) {
+    window.setTimeout(() => {
+      if (window.loadObjOPreview) window.loadObjOPreview(data || appState.data, { force, source, view, tempStale: appState.tempObjOStale });
+    }, 250);
+    return;
+  }
+  window.loadObjOPreview(data || appState.data, { force, source, view, tempStale: appState.tempObjOStale });
+}
+
+window.addEventListener("obj-o-viewer-ready", () => refreshObjOPreview(appState.data));
+
+function updateSaveButtons(data) {
+  const nameInput = $("editorName");
+  const saveButton = $("saveBtn");
+  const hasName = Boolean(editorNameValue());
+  const available = Boolean(data?.text_objs_available);
+  if (nameInput) {
+    nameInput.classList.toggle("required-missing", !hasName);
+    nameInput.setAttribute("aria-invalid", hasName ? "false" : "true");
+  }
+  if (saveButton) {
+    saveButton.disabled = !hasName || !available;
+    if (!hasName) {
+      saveButton.title = "请先输入名字";
+    } else if (!available) {
+      const missing = (data?.missing_text_objs || []).slice(0, 4).join(", ");
+      saveButton.title = missing ? `缺少文字 OBJ: ${missing}` : "未找到 Text_objs";
+    } else {
+      saveButton.title = "保存 Annotation、Mutiviews 和 Obj-O";
+    }
+  }
+}
+
+function updateObjOButton(data) {
+  updateSaveButtons(data);
+}
+
+function selectTargetKind(kind) {
+  syncSelectedFromInputs();
+  appState.selectedKind = kind;
+  renderTargetSelector();
+  renderSelectedTarget();
+  setStatus("已切换标签/锚点；移动会记录在页面中，点击“生成投影”后再更新投影。");
+}
+
+async function loadAnnotation() {
+  try {
+    if (!appState.selectedSample) {
+      setStatus("请先选择样本。", true);
+      return;
+    }
+    showStageToast("正在加载样本...");
+    window.clearObjOPreview?.();
+    setStatus("正在加载 JSON...");
+    const data = await postJson("/api/load", {
+      annotation_json: appState.selectedSample.annotation_path,
+      obj_p_path: appState.selectedSample.obj_p_path || null,
+      dataset_root: $("datasetRoot").value.trim(),
+      output_root: $("outputRoot").value.trim(),
+    });
+    appState.selectedIndex = 0;
+    appState.selectedKind = "label";
+    appState.objOSource = "input";
+    appState.objOView = "main";
+    appState.tempObjOStale = true;
+    appState.baselineAnnotationPath = "";
+    appState.targetBaselines = new Map();
+    if ($("objOSourceSelect")) $("objOSourceSelect").value = "input";
+    if ($("objOViewSelect")) $("objOViewSelect").value = "main";
+    document.querySelector('input[name="targetKind"][value="label"]').checked = true;
+    renderState(data);
+    finishStageToast("样本加载完成");
+  } catch (error) {
+    finishStageToast(error.message || String(error), true);
+    setStatus(error.message || String(error), true);
+  }
+}
+
+async function renderProjection(endpoint = "/api/render") {
+  if (!appState.data?.loaded) return;
+  try {
+    const isSave = endpoint === "/api/save";
+    if (isSave && !requireEditorName("保存完整结果")) return;
+    window.clearTimeout(appState.selectionRenderTimer);
+    showStageToast(isSave ? "正在保存完整结果..." : "正在生成投影...");
+    setStatus(isSave ? "正在保存 Annotation、Mutiviews 和 Obj-O..." : "正在生成五个预览投影，请稍等...");
+    const data = await postJson(endpoint, payloadFromState());
+    if (!isSave) appState.tempObjOStale = false;
+    appState.objOSource = isSave ? "output" : "temp";
+    if ($("objOSourceSelect")) $("objOSourceSelect").value = appState.objOSource;
+    captureTargetBaselines(data, true);
+    renderState(data, { forceObjPreview: true });
+    if (isSave) await refreshSamplesPreservingCurrent(data.annotation_path);
+    finishStageToast(isSave ? "完整结果保存完成" : "投影生成完成");
+    setStatus(isSave ? `已保存完整结果：${data.manual_output_info?.layout_dir || data.adjusted_json_path}` : "预览投影已生成，JSON 未写入。");
+  } catch (error) {
+    finishStageToast(error.message || String(error), true);
+    setStatus(error.message || String(error), true);
+  }
+}
+
+function nudge(axis, delta) {
+  const step = numberValue("stepSize");
+  const target = $(axisInputs[axis]);
+  target.value = (Number(target.value || 0) + Number(delta) * step).toFixed(6);
+  syncSelectedFromInputs();
+  resetMoveSliders();
+  markDirty();
+  scheduleAnchorSnap();
+}
+
+function initEvents() {
+  $("refreshSamples").addEventListener("click", () => refreshSamples({ autoLoad: true }));
+  $("sampleSelect").addEventListener("change", async (event) => {
+    selectSample(event.target.value);
+    await loadAnnotation();
+  });
+  $("loadBtn").addEventListener("click", loadAnnotation);
+  $("renderBtn").addEventListener("click", () => renderProjection("/api/render"));
+  $("saveBtn").addEventListener("click", () => renderProjection("/api/save"));
+  $("objOSourceSelect")?.addEventListener("change", (event) => {
+    appState.objOSource = event.target.value;
+    updateObjOUpdateHint();
+    updateObjOViewSelect(appState.data);
+    refreshObjOPreview(appState.data, true);
+  });
+  $("objOViewSelect")?.addEventListener("change", (event) => {
+    appState.objOView = event.target.value;
+    refreshObjOPreview(appState.data, true);
+    updateSaveButtons(appState.data);
+  });
+  $("resetObjOViewBtn")?.addEventListener("click", () => window.resetObjOView?.());
+  $("targetSelect").addEventListener("change", (event) => selectTarget(Number(event.target.value)));
+  for (const radio of document.querySelectorAll('input[name="targetKind"]')) {
+    radio.addEventListener("change", (event) => selectTargetKind(event.target.value));
+  }
+
+  for (const id of ["camX", "camY", "camZ"]) {
+    $(id).addEventListener("input", () => {
+      syncSelectedFromInputs();
+      resetMoveSliders();
+      markDirty();
+      scheduleAnchorSnap();
+    });
+  }
+  $("stepSize").addEventListener("input", renderViewGuides);
+  $("outputRoot").addEventListener("input", () => markDirty(false));
+  $("editorName").addEventListener("input", () => {
+    markDirty(false);
+    updateSaveButtons(appState.data);
+  });
+  for (const button of document.querySelectorAll(".move-toolbar button[data-axis]")) {
+    button.addEventListener("click", () => nudge(Number(button.dataset.axis), Number(button.dataset.delta)));
+  }
+  for (const id of sliderIds) {
+    const slider = $(id);
+    if (!slider) continue;
+    slider.addEventListener("pointerdown", () => primeMoveSlider(slider));
+    slider.addEventListener("focus", () => primeMoveSlider(slider));
+    slider.addEventListener("input", () => applyMoveSlider(slider));
+    slider.addEventListener("change", () => finishMoveSlider(slider));
+    slider.addEventListener("pointerup", () => finishMoveSlider(slider));
+    slider.addEventListener("blur", () => finishMoveSlider(slider));
+  }
+}
+
+async function init() {
+  placeActionButtons();
+  initEvents();
+  try {
+    const defaults = await getJson("/api/defaults");
+    $("datasetRoot").value = defaults.dataset_root || "";
+    $("outputRoot").value = defaults.output_root || defaults.dataset_root || "";
+    await refreshSamples();
+    if (appState.selectedSample) {
+      await loadAnnotation();
+    } else {
+      const data = await getJson("/api/state");
+      renderState(data);
+    }
+  } catch (error) {
+    setStatus(error.message || String(error), true);
+  }
+}
+
+init();
