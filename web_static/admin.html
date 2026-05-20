@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>微调结果审核</title>
+    <link rel="icon" href="data:," />
+    <link rel="stylesheet" href="/static/style.css" />
+  </head>
+  <body class="admin-page">
+    <header class="admin-topbar">
+      <div>
+        <span>Manual Adjust Admin</span>
+        <h1>微调结果审核</h1>
+      </div>
+      <label>提交包
+        <select id="submissionSelect"></select>
+      </label>
+      <label>审核员
+        <input id="reviewerName" type="text" spellcheck="false" placeholder="请输入审核员名字" />
+      </label>
+      <div class="admin-progress">
+        <strong id="progressText">-</strong>
+        <span id="adminStatus">等待加载</span>
+      </div>
+      <button id="exportReviewBtn" class="secondary" type="button">导出审核文件</button>
+    </header>
+
+    <main class="admin-workbench">
+      <button id="prevSampleBtn" class="admin-nav left" type="button" aria-label="上一个样本">‹</button>
+
+      <section class="admin-info-panel">
+        <div class="admin-sample-title">
+          <span id="sampleCounter">-</span>
+          <h2 id="adminSampleTitle">未加载</h2>
+        </div>
+        <dl class="admin-meta-list">
+          <div><dt>微调者</dt><dd id="adjusterName">-</dd></div>
+          <div><dt>自评</dt><dd id="selfRatingText">-</dd></div>
+          <div><dt>状态</dt><dd id="reviewStatusText">-</dd></div>
+        </dl>
+        <section class="admin-readonly-field" aria-labelledby="selfRemarkLabel">
+          <span id="selfRemarkLabel">微调备注</span>
+          <p id="selfRemarkText">-</p>
+        </section>
+        <label>审核评价
+          <select id="adminRating">
+            <option value="">请选择</option>
+            <option value="good">好</option>
+            <option value="medium">中</option>
+            <option value="bad">差</option>
+          </select>
+        </label>
+        <label>审核备注
+          <textarea id="adminRemark" rows="5" spellcheck="false" placeholder="填写审核意见、需要返修的问题或通过原因"></textarea>
+        </label>
+        <button id="saveReviewBtn" class="primary" type="button">保存审核</button>
+        <div class="admin-history" id="historyList"></div>
+      </section>
+
+      <section class="admin-projections">
+        <section class="admin-obj-panel">
+          <header>
+            <strong>OBJ-O</strong>
+            <select id="adminObjViewSelect" aria-label="OBJ-O view">
+              <option value="main">主视角</option>
+              <option value="up">上视角</option>
+              <option value="down">下视角</option>
+              <option value="left">左视角</option>
+              <option value="right">右视角</option>
+            </select>
+            <button id="adminResetObjBtn" class="secondary" type="button">重置</button>
+          </header>
+          <div class="obj-viewer-shell">
+            <canvas id="objOCanvas" aria-label="OBJ-O 3D preview"></canvas>
+            <div id="objOEmpty" class="obj-viewer-empty">请选择提交包</div>
+          </div>
+        </section>
+        <article class="admin-image-card"><header>main</header><img id="adminImgMain" alt="main projection" /></article>
+        <article class="admin-image-card"><header>up</header><img id="adminImgUp" alt="up projection" /></article>
+        <article class="admin-image-card"><header>down</header><img id="adminImgDown" alt="down projection" /></article>
+        <article class="admin-image-card"><header>left</header><img id="adminImgLeft" alt="left projection" /></article>
+        <article class="admin-image-card"><header>right</header><img id="adminImgRight" alt="right projection" /></article>
+      </section>
+
+      <button id="nextSampleBtn" class="admin-nav right" type="button" aria-label="下一个样本">›</button>
+    </main>
+
+    <script type="importmap">
+      {
+        "imports": {
+          "three": "https://unpkg.com/three@0.164.1/build/three.module.js",
+          "three/addons/": "https://unpkg.com/three@0.164.1/examples/jsm/"
+        }
+      }
+    </script>
+    <script type="module" src="/static/obj_o_viewer.js"></script>
+    <script src="/static/admin.js"></script>
+  </body>
+</html>

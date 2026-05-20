@@ -1,15 +1,18 @@
 from __future__ import annotations
 
 import json
+import io
 import mimetypes
 import re
 import threading
+import zipfile
 import colorsys
 from copy import deepcopy
 from dataclasses import replace
+from datetime import datetime
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, unquote, urlparse
+from urllib.parse import parse_qs, quote, unquote, urlparse
 
 import numpy as np
 from PIL import Image, ImageDraw
@@ -29,11 +32,14 @@ DATA_ROOT = APP_ROOT / "data"
 DATA_INPUT_ROOT = DATA_ROOT / "input"
 DATA_OUTPUT_ROOT = DATA_ROOT / "output"
 DATA_TEMP_ROOT = DATA_ROOT / "temp"
+DATA_ADMIN_ROOT = DATA_ROOT / "admin"
+DATA_EXPORT_ROOT = DATA_ROOT / "export"
 DEFAULT_DATASET_ROOT = DATA_INPUT_ROOT
 DEFAULT_OUTPUT_ROOT = DATA_OUTPUT_ROOT
 DEFAULT_PORT = 8780
 INPUT_LAYOUT_LEVEL = "layout2"
 OUTPUT_LAYOUT_LEVEL = "layout1"
+RECORDS_FILENAME = "manual_adjust_records.json"
 DEFAULT_ANNOTATION_JSON = DEFAULT_DATASET_ROOT / "Layout" / "Chair" / "691" / INPUT_LAYOUT_LEVEL / "Annotation" / "691.json"
 DEFAULT_OBJ_P_PATH = DEFAULT_DATASET_ROOT / "Obj-P" / "Chair" / "691" / "691-P.obj"
 
@@ -48,6 +54,8 @@ STATE: dict = {
     "dataset_root": None,
     "output_root": None,
     "adjusted_json_path": None,
+    "source_annotation_path": None,
+    "loaded_from_output": False,
 }
 SNAP_MESH_CACHE: dict[str, tuple[np.ndarray, dict[str, list[list[int]]]]] = {}
 
@@ -65,6 +73,36 @@ def require_editor_name(annotation: dict) -> str:
     if not name:
         raise ValueError("Please enter a name before saving.")
     return name
+
+
+def now_iso() -> str:
+    return datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def parse_iso(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(str(value))
+    except ValueError:
+        return None
+
+
+RATING_LABELS = {
+    "good": "好",
+    "medium": "中",
+    "bad": "差",
+    "unknown": "未知",
+}
+REVIEW_RATINGS = {"good", "medium", "bad"}
+
+
+def normalize_rating(value: str | None, field_name: str = "rating", allow_unknown: bool = False) -> str:
+    rating = str(value or "").strip().lower()
+    valid = set(RATING_LABELS) if allow_unknown else REVIEW_RATINGS
+    if rating not in valid:
+        raise ValueError(f"{field_name} must be one of: good, medium, bad.")
+    return rating
 
 
 def numeric_name_key(value: str) -> tuple[int, int | str]:
@@ -169,6 +207,49 @@ def output_obj_o_path(output_root: Path, annotation_path: Path, annotation: dict
     return output_obj_o_dir(output_root, sample_name, OUTPUT_LAYOUT_LEVEL, category) / f"{sample_name}-main-O.obj"
 
 
+def records_path(root: Path | str | None) -> Path:
+    return (Path(root).expanduser().resolve() if root else DEFAULT_OUTPUT_ROOT) / RECORDS_FILENAME
+
+
+def sample_key(category: str | None, sample_name: str | None) -> str:
+    return f"{category or ''}/{sample_name or ''}".strip("/")
+
+
+def load_records(root: Path | str | None) -> dict:
+    path = records_path(root)
+    if not path.is_file():
+        return {"schema_version": 1, "updated_at": None, "samples": {}}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Invalid records file: {path}: {exc}") from exc
+    if not isinstance(data, dict):
+        data = {}
+    data.setdefault("schema_version", 1)
+    data.setdefault("updated_at", None)
+    samples = data.get("samples")
+    if not isinstance(samples, dict):
+        samples = {}
+    data["samples"] = samples
+    return data
+
+
+def save_records(root: Path | str | None, records: dict) -> Path:
+    path = records_path(root)
+    records["schema_version"] = 1
+    records["updated_at"] = now_iso()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(records, indent=2, ensure_ascii=False), encoding="utf-8")
+    return path
+
+
+def record_for_sample(records: dict | None, category: str | None, sample_name: str | None) -> dict | None:
+    if not records:
+        return None
+    sample = records.get("samples", {}).get(sample_key(category, sample_name))
+    return sample if isinstance(sample, dict) else None
+
+
 def projection_filename(sample_name: str, view: str) -> str:
     suffix = "combined" if view == "combined" else view
     return f"{sample_name}-{suffix}.png"
@@ -200,6 +281,46 @@ def manual_output_info(output_root: Path | None, sample_name: str, category: str
     }
 
 
+def review_status_label(record: dict | None) -> str:
+    if not record:
+        return ""
+    status = str(record.get("status") or "")
+    cycle = int(record.get("review_cycle") or 0)
+    if status == "adjusted":
+        return "已微调待审核"
+    if status == "changes_required":
+        return "已审核需修改"
+    if status == "reviewed":
+        return "已微调并审核"
+    if status == "pending_recheck":
+        return f"已微调待复核{cycle or 1}"
+    return ""
+
+
+def record_event_label(event: str, cycle: int = 0) -> str:
+    if event == "adjusted":
+        return "已微调待审核"
+    if event == "reviewed":
+        return "已微调并审核"
+    if event == "changes_required":
+        return "已审核需修改"
+    if event == "pending_recheck":
+        return f"已微调待复核{cycle or 1}"
+    if event == "rechecked":
+        return "已微调并审核"
+    return event
+
+
+def reviewed_for_current_cycle(record: dict | None) -> bool:
+    return bool(record and str(record.get("status") or "") in {"reviewed", "changes_required"})
+
+
+def needs_admin_review(record: dict | None) -> bool:
+    if not record:
+        return True
+    return str(record.get("status") or "") in {"adjusted", "pending_recheck"}
+
+
 def preview_label_name(index: int) -> str:
     return f"label_{index + 1}"
 
@@ -215,14 +336,19 @@ def resolve_projection_images(
     category: str,
     sample_name: str,
     annotation_path: Path | None = None,
+    prefer_output: bool = False,
 ) -> dict[str, str]:
     recorded = dict(annotation.get("projection_images") or {})
     resolved: dict[str, str] = {}
     roots: list[Path] = []
     resolved_output_root = Path(output_root).expanduser().resolve()
+    if prefer_output:
+        roots.append(output_root)
     if annotation_path is not None:
         roots.append(infer_dataset_root(annotation_path))
-    roots.extend([output_root, dataset_root])
+    roots.extend([dataset_root])
+    if not prefer_output:
+        roots.append(output_root)
     unique_roots: list[Path] = []
     seen_roots: set[str] = set()
     for root in roots:
@@ -462,7 +588,7 @@ def dataset_root_for_annotation(json_path: Path) -> Path:
     return json_path.parent.resolve()
 
 
-def sample_record_from_json(json_path: Path, output_root: Path | None = None) -> dict:
+def sample_record_from_json(json_path: Path, output_root: Path | None = None, records: dict | None = None) -> dict:
     json_path = json_path.resolve()
     dataset_root = dataset_root_for_annotation(json_path)
     category = ""
@@ -478,6 +604,7 @@ def sample_record_from_json(json_path: Path, output_root: Path | None = None) ->
     if dataset_root != DEFAULT_DATASET_ROOT and DEFAULT_DATASET_ROOT in dataset_root.parents:
         display = f"{dataset_root.name} / {display}"
     output_info = manual_output_info(output_root or DEFAULT_OUTPUT_ROOT, sample, category)
+    sample_record = record_for_sample(records or load_records(output_root or DEFAULT_OUTPUT_ROOT), category, sample)
     return {
         "name": sample,
         "display_name": display,
@@ -487,6 +614,13 @@ def sample_record_from_json(json_path: Path, output_root: Path | None = None) ->
         "obj_p_path": str(obj_path) if obj_path else "",
         "manual_output_complete": bool(output_info["complete"]),
         "manual_output_layout_dir": output_info.get("layout_dir"),
+        "review_status": str(sample_record.get("status") or "") if sample_record else "",
+        "review_status_label": review_status_label(sample_record),
+        "reviewed": reviewed_for_current_cycle(sample_record),
+        "needs_admin_review": needs_admin_review(sample_record),
+        "self_rating": sample_record.get("adjuster", {}).get("rating") if sample_record else "",
+        "admin_rating": sample_record.get("review", {}).get("rating") if sample_record else "",
+        "admin_rating_label": sample_record.get("review", {}).get("rating_label") if sample_record else "",
     }
 
 
@@ -528,6 +662,7 @@ def list_annotation_samples(root: Path | str, output_root: Path | str | None = N
 
     seen: set[Path] = set()
     samples: list[dict] = []
+    records = load_records(resolved_output_root)
     direct_roots = [root]
     direct_roots.extend(
         path
@@ -541,7 +676,7 @@ def list_annotation_samples(root: Path | str, output_root: Path | str | None = N
                 resolved = json_path.resolve()
                 if resolved not in seen:
                     seen.add(resolved)
-                    samples.append(sample_record_from_json(resolved, resolved_output_root))
+                    samples.append(sample_record_from_json(resolved, resolved_output_root, records))
 
     samples = dedupe_sample_records(samples)
     samples.sort(key=lambda item: (item.get("category") or "", numeric_name_key(item["name"]), item["annotation_path"]))
@@ -669,19 +804,26 @@ def current_state_payload() -> dict:
         dataset_root = STATE.get("dataset_root")
         output_root = STATE.get("output_root")
         adjusted_json_path = STATE.get("adjusted_json_path")
+        source_annotation_path = STATE.get("source_annotation_path")
+        loaded_from_output = bool(STATE.get("loaded_from_output"))
     if annotation is None:
         return {"loaded": False}
     text_info = text_objs_info(annotation_path, annotation, dataset_root, output_root, obj_p_path)
     obj_o_sources = resolve_obj_o_sources(annotation_path, annotation, dataset_root, output_root) if annotation_path else {}
-    obj_o_default_source = next((name for name in ("input", "output", "temp") if obj_o_sources.get(name, {}).get("exists")), "input")
+    obj_o_preference = ("output", "temp", "input") if loaded_from_output else ("input", "output", "temp")
+    obj_o_default_source = next((name for name in obj_o_preference if obj_o_sources.get(name, {}).get("exists")), "input")
     obj_o_info = obj_o_sources.get(obj_o_default_source) or {}
     category, sample_name = annotation_identity(annotation_path, annotation)
     output_info = manual_output_info(output_root, sample_name, category)
+    records = load_records(output_root)
+    current_record = record_for_sample(records, category, sample_name) or {}
     return {
         "loaded": True,
         "dataset_root": str(dataset_root) if dataset_root else None,
         "output_root": str(output_root) if output_root else None,
         "annotation_path": str(annotation_path),
+        "source_annotation_path": str(source_annotation_path or annotation_path),
+        "loaded_from_output": loaded_from_output,
         "obj_p_path": str(obj_p_path),
         "adjusted_json_path": str(adjusted_json_path) if adjusted_json_path else None,
         "editor_name": current_editor_name(annotation),
@@ -705,6 +847,18 @@ def current_state_payload() -> dict:
         "part_overlay_images": part_overlay_images,
         "manual_output_complete": bool(output_info["complete"]),
         "manual_output_info": output_info,
+        "records_path": str(records_path(output_root)),
+        "current_record": current_record,
+        "review_status": str(current_record.get("status") or ""),
+        "review_status_label": review_status_label(current_record),
+        "reviewed": reviewed_for_current_cycle(current_record),
+        "needs_admin_review": needs_admin_review(current_record),
+        "self_rating": current_record.get("adjuster", {}).get("rating") or "",
+        "adjuster_remark": current_record.get("adjuster", {}).get("remark") or "",
+        "admin_rating": current_record.get("review", {}).get("rating") or "",
+        "admin_rating_label": current_record.get("review", {}).get("rating_label") or "",
+        "admin_remark": current_record.get("review", {}).get("remark") or "",
+        "admin_reviewer_name": current_record.get("review", {}).get("reviewer_name") or "",
     }
 
 
@@ -1482,12 +1636,21 @@ def load_annotation(
     obj_p_path: Path | str | None = None,
     dataset_root: Path | str | None = None,
     output_root: Path | str | None = None,
+    start_from_output: bool = False,
 ) -> dict:
     annotation_path = Path(annotation_json).expanduser().resolve()
-    annotation = load_json(annotation_path)
-    normalize_group_ids(annotation)
+    base_annotation = load_json(annotation_path)
     resolved_dataset_root = Path(dataset_root).expanduser().resolve() if dataset_root else infer_dataset_root(annotation_path)
     resolved_output_root = Path(output_root).expanduser().resolve() if output_root else DEFAULT_OUTPUT_ROOT
+    source_annotation_path = annotation_path
+    annotation = base_annotation
+    if start_from_output:
+        candidate = output_json_path(resolved_output_root, annotation_path, base_annotation)
+        if not candidate.is_file():
+            raise FileNotFoundError(f"No adjusted output annotation exists: {candidate}")
+        source_annotation_path = candidate.resolve()
+        annotation = load_json(source_annotation_path)
+    normalize_group_ids(annotation)
     apply_internal_camera(annotation)
     annotation.pop("editor_name", None)
     annotation.pop("annotator_name", None)
@@ -1501,6 +1664,7 @@ def load_annotation(
         model_cat,
         sample_name,
         annotation_path,
+        prefer_output=start_from_output,
     )
     part_overlay_images = {}
     with STATE_LOCK:
@@ -1512,14 +1676,22 @@ def load_annotation(
         STATE["dataset_root"] = resolved_dataset_root
         STATE["output_root"] = resolved_output_root
         STATE["adjusted_json_path"] = adjusted_json_path
+        STATE["source_annotation_path"] = source_annotation_path
+        STATE["loaded_from_output"] = bool(start_from_output)
     return current_state_payload()
 
 
-def load_sample(dataset_root: Path | str, category: str, sample_name: str, output_root: Path | str | None = None) -> dict:
+def load_sample(
+    dataset_root: Path | str,
+    category: str,
+    sample_name: str,
+    output_root: Path | str | None = None,
+    start_from_output: bool = False,
+) -> dict:
     root = Path(dataset_root).expanduser().resolve()
     annotation_path = sample_json_path(root, category, sample_name)
     obj_p_path = sample_obj_p_path(root, category, sample_name)
-    return load_annotation(annotation_path, obj_p_path, root, output_root)
+    return load_annotation(annotation_path, obj_p_path, root, output_root, start_from_output=start_from_output)
 
 
 def apply_update(payload: dict) -> dict:
@@ -1653,11 +1825,503 @@ def render_current(write_json: bool = False) -> dict:
     return current_state_payload()
 
 
-def save_current() -> dict:
+def update_adjustment_record(metadata: dict) -> Path:
+    rating = normalize_rating(metadata.get("self_rating"), "self_rating")
+    remark = str(metadata.get("adjuster_remark") or "").strip()
+    with STATE_LOCK:
+        annotation = deepcopy(STATE["annotation"])
+        annotation_path = STATE["annotation_path"]
+        output_root = STATE["output_root"]
+    if annotation is None or annotation_path is None:
+        raise ValueError("No annotation loaded.")
+    editor_name = require_editor_name(annotation)
+    category, sample_name = annotation_identity(annotation_path, annotation)
+    records = load_records(output_root)
+    key = sample_key(category, sample_name)
+    samples = records.setdefault("samples", {})
+    existing = samples.get(key) if isinstance(samples.get(key), dict) else {}
+    now = now_iso()
+    cycle = int(existing.get("review_cycle") or 0)
+    status = str(existing.get("status") or "")
+    if status in {"reviewed", "changes_required"}:
+        cycle += 1
+        next_status = "pending_recheck"
+        event = "pending_recheck"
+    elif status == "pending_recheck":
+        next_status = "pending_recheck"
+        event = "pending_recheck"
+        cycle = max(1, cycle)
+    else:
+        next_status = "adjusted"
+        event = "adjusted"
+    if event == "pending_recheck" and cycle <= 0:
+        cycle = 1
+
+    output_layout = layout_dir(output_root, sample_name, OUTPUT_LAYOUT_LEVEL, category)
+    history = list(existing.get("history") or [])
+    history.append(
+        {
+            "event": event,
+            "label": record_event_label(event, cycle),
+            "at": now,
+            "actor": "adjuster",
+            "name": editor_name,
+            "rating": rating,
+            "remark": remark,
+            "cycle": cycle,
+        }
+    )
+    samples[key] = {
+        **existing,
+        "key": key,
+        "category": category,
+        "sample_id": sample_name,
+        "input_annotation_path": str(annotation_path),
+        "output_layout_dir": output_layout.relative_to(Path(output_root).expanduser().resolve()).as_posix(),
+        "status": next_status,
+        "review_cycle": cycle,
+        "adjusted_at": now,
+        "adjuster": {
+            "name": editor_name,
+            "rating": rating,
+            "rating_label": RATING_LABELS[rating],
+            "remark": remark,
+            "updated_at": now,
+        },
+        "review": existing.get("review") or {},
+        "history": history,
+    }
+    return save_records(output_root, records)
+
+
+def save_current(metadata: dict | None = None) -> dict:
+    normalize_rating((metadata or {}).get("self_rating"), "self_rating")
     snap_report = snap_all_anchors_in_state()
-    payload = render_current(write_json=True)
+    render_current(write_json=True)
+    update_adjustment_record(metadata or {})
+    payload = current_state_payload()
     payload["anchor_snap_report"] = snap_report
     return payload
+
+
+def export_filename(name: str | None = None) -> str:
+    raw_name = str(name or "").strip()
+    if not raw_name:
+        with STATE_LOCK:
+            annotation = STATE.get("annotation")
+            if annotation is not None:
+                raw_name = current_editor_name(annotation)
+    cleaned = re.sub(r'[<>:"/\\|?*\x00-\x1f]+', "_", raw_name or "manual_adjust").strip(" ._")
+    cleaned = cleaned or "manual_adjust"
+    return f"{cleaned}_{datetime.now().strftime('%Y%m%d')}.zip"
+
+
+def file_mtime_iso(path: Path) -> str:
+    try:
+        return datetime.fromtimestamp(path.stat().st_mtime).astimezone().isoformat(timespec="seconds")
+    except OSError:
+        return now_iso()
+
+
+def output_annotation_identity(annotation_path: Path, output_root: Path) -> tuple[str, str]:
+    try:
+        annotation = load_json(annotation_path)
+    except Exception:
+        annotation = {}
+    category, sample_name = annotation_identity(annotation_path, annotation)
+    if category and sample_name:
+        return category, sample_name
+    try:
+        parts = annotation_path.relative_to(output_root).parts
+        if len(parts) >= 5 and parts[0] == "Layout":
+            return category or parts[1], sample_name or parts[2]
+    except ValueError:
+        pass
+    return category, sample_name
+
+
+def ensure_export_records(output_root: Path | str, name: str | None = None) -> dict:
+    root = Path(output_root).expanduser().resolve()
+    records = load_records(root)
+    samples = records.setdefault("samples", {})
+    adjuster_name = str(name or "").strip() or "unknown"
+    created = 0
+    for annotation_path in sorted(root.glob(f"Layout/*/*/{OUTPUT_LAYOUT_LEVEL}/Annotation/*.json"), key=lambda item: str(item).lower()):
+        category, sample_name = output_annotation_identity(annotation_path, root)
+        if not category or not sample_name:
+            continue
+        key = sample_key(category, sample_name)
+        if isinstance(samples.get(key), dict):
+            continue
+        layout_path = layout_dir(root, sample_name, OUTPUT_LAYOUT_LEVEL, category)
+        adjusted_at = file_mtime_iso(annotation_path)
+        samples[key] = {
+            "key": key,
+            "category": category,
+            "sample_id": sample_name,
+            "input_annotation_path": "",
+            "output_layout_dir": layout_path.relative_to(root).as_posix(),
+            "status": "adjusted",
+            "review_cycle": 0,
+            "adjusted_at": adjusted_at,
+            "adjuster": {
+                "name": adjuster_name,
+                "rating": "unknown",
+                "rating_label": RATING_LABELS["unknown"],
+                "remark": "",
+                "updated_at": adjusted_at,
+            },
+            "review": {},
+            "history": [
+                {
+                    "event": "adjusted",
+                    "label": record_event_label("adjusted", 0),
+                    "at": adjusted_at,
+                    "actor": "adjuster",
+                    "name": adjuster_name,
+                    "rating": "unknown",
+                    "remark": "",
+                    "cycle": 0,
+                }
+            ],
+        }
+        created += 1
+    if created:
+        save_records(root, records)
+    return {"created": created, "records_path": str(records_path(root))}
+
+
+def build_output_export_zip(output_root: Path | str, name: str | None = None) -> tuple[bytes, str]:
+    root = Path(output_root).expanduser().resolve()
+    if not root.is_dir():
+        raise FileNotFoundError(f"Output root does not exist: {root}")
+    ensure_export_records(root, name)
+    filename = export_filename(name)
+    buffer = io.BytesIO()
+    file_count = 0
+    with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for path in sorted(root.rglob("*"), key=lambda item: str(item).lower()):
+            relative = path.relative_to(root).as_posix()
+            if not relative or relative == "preview" or relative.startswith("preview/"):
+                continue
+            if path.is_dir():
+                archive.writestr(f"{relative.rstrip('/')}/", b"")
+                continue
+            archive.write(path, relative)
+            file_count += 1
+
+    if file_count == 0:
+        raise FileNotFoundError(f"No output files found under: {root}")
+    return buffer.getvalue(), filename
+
+
+def unique_export_path(filename: str) -> Path:
+    DATA_EXPORT_ROOT.mkdir(parents=True, exist_ok=True)
+    safe_name = safe_stem(Path(filename).stem) + Path(filename).suffix
+    candidate = DATA_EXPORT_ROOT / safe_name
+    if not candidate.exists():
+        return candidate
+    stem = candidate.stem
+    suffix = candidate.suffix
+    counter = 2
+    while True:
+        numbered = DATA_EXPORT_ROOT / f"{stem}_{counter}{suffix}"
+        if not numbered.exists():
+            return numbered
+        counter += 1
+
+
+def save_export_file(data: bytes, filename: str) -> dict:
+    path = unique_export_path(filename)
+    path.write_bytes(data)
+    return {
+        "filename": path.name,
+        "path": str(path.resolve()),
+        "relative_path": path.relative_to(APP_ROOT).as_posix(),
+        "size": len(data),
+    }
+
+
+def export_output_zip_file(output_root: Path | str, name: str | None = None) -> dict:
+    data, filename = build_output_export_zip(output_root, name)
+    result = save_export_file(data, filename)
+    result["kind"] = "zip"
+    return result
+
+
+def path_is_within(path: Path, root: Path) -> bool:
+    try:
+        path.resolve().relative_to(root.resolve())
+        return True
+    except ValueError:
+        return False
+
+
+def merge_history(local_history: list, imported_history: list) -> list:
+    result = list(local_history or [])
+    seen = {
+        (
+            str(item.get("event") or ""),
+            str(item.get("at") or ""),
+            str(item.get("actor") or ""),
+            str(item.get("cycle") or ""),
+        )
+        for item in result
+        if isinstance(item, dict)
+    }
+    for item in imported_history or []:
+        if not isinstance(item, dict):
+            continue
+        key = (
+            str(item.get("event") or ""),
+            str(item.get("at") or ""),
+            str(item.get("actor") or ""),
+            str(item.get("cycle") or ""),
+        )
+        if key not in seen:
+            seen.add(key)
+            result.append(item)
+    return result
+
+
+def merge_review_records(output_root: Path | str, imported_records: dict) -> dict:
+    if not isinstance(imported_records, dict):
+        raise ValueError("Imported review records must be a JSON object.")
+    imported_samples = imported_records.get("samples") or {}
+    if not isinstance(imported_samples, dict):
+        raise ValueError("Imported review records do not contain samples.")
+    local = load_records(output_root)
+    local_samples = local.setdefault("samples", {})
+    merged = 0
+    skipped = 0
+    for key, imported_sample in imported_samples.items():
+        if key not in local_samples or not isinstance(imported_sample, dict):
+            skipped += 1
+            continue
+        imported_review = imported_sample.get("review") or {}
+        if not imported_review.get("reviewed_at"):
+            skipped += 1
+            continue
+        local_sample = local_samples[key] if isinstance(local_samples[key], dict) else {}
+        imported_review_at = parse_iso(imported_review.get("reviewed_at"))
+        local_adjusted_at = parse_iso(local_sample.get("adjusted_at"))
+        imported_status = str(imported_sample.get("status") or "")
+        if imported_review.get("rating") == "bad":
+            imported_status = "changes_required"
+        imported_status = imported_status or "reviewed"
+        local_sample["review"] = imported_review
+        local_sample["review_cycle"] = max(int(local_sample.get("review_cycle") or 0), int(imported_sample.get("review_cycle") or 0))
+        local_sample["history"] = merge_history(local_sample.get("history") or [], imported_sample.get("history") or [])
+        if not (
+            str(local_sample.get("status") or "") == "pending_recheck"
+            and imported_review_at is not None
+            and local_adjusted_at is not None
+            and local_adjusted_at > imported_review_at
+        ):
+            local_sample["status"] = imported_status
+        local_samples[key] = local_sample
+        merged += 1
+    save_records(output_root, local)
+    return {"merged": merged, "skipped": skipped, "records_path": str(records_path(output_root))}
+
+
+def admin_submission_root(name: str | None) -> Path:
+    raw_name = str(name or "").strip()
+    if raw_name in {"", "."}:
+        root = DATA_ADMIN_ROOT.resolve()
+    else:
+        root = (DATA_ADMIN_ROOT / raw_name).resolve()
+    if not path_is_within(root, DATA_ADMIN_ROOT.resolve()):
+        raise ValueError("Invalid admin submission.")
+    return root
+
+
+def list_admin_submissions() -> dict:
+    DATA_ADMIN_ROOT.mkdir(parents=True, exist_ok=True)
+    roots: list[Path] = []
+    if records_path(DATA_ADMIN_ROOT).is_file():
+        roots.append(DATA_ADMIN_ROOT.resolve())
+    roots.extend(path.resolve() for path in DATA_ADMIN_ROOT.iterdir() if path.is_dir() and records_path(path).is_file())
+    submissions = []
+    for root in roots:
+        records = load_records(root)
+        samples = records.get("samples") or {}
+        adjusters = sorted(
+            {
+                str(sample.get("adjuster", {}).get("name") or "").strip()
+                for sample in samples.values()
+                if isinstance(sample, dict) and str(sample.get("adjuster", {}).get("name") or "").strip()
+            }
+        )
+        reviewed_count = sum(1 for sample in samples.values() if isinstance(sample, dict) and reviewed_for_current_cycle(sample))
+        submission_name = "." if root == DATA_ADMIN_ROOT.resolve() else root.name
+        submissions.append(
+            {
+                "name": submission_name,
+                "display_name": root.name if submission_name != "." else "data/admin",
+                "path": str(root),
+                "adjusters": adjusters,
+                "total": len(samples),
+                "reviewed_count": reviewed_count,
+                "pending_count": len(samples) - reviewed_count,
+            }
+        )
+    submissions.sort(key=lambda item: item["display_name"].lower())
+    return {"root": str(DATA_ADMIN_ROOT), "submissions": submissions}
+
+
+def record_sort_key(item: tuple[str, dict]) -> tuple[int, int, str, tuple[int, int | str]]:
+    key, sample = item
+    status_rank = 0 if needs_admin_review(sample) else 1
+    rating_rank = {"bad": 0, "medium": 1, "good": 2}.get(str(sample.get("adjuster", {}).get("rating") or ""), 3)
+    return (status_rank, rating_rank, str(sample.get("category") or ""), numeric_name_key(str(sample.get("sample_id") or key)))
+
+
+def admin_sample_summaries(submission_root: Path) -> list[dict]:
+    records = load_records(submission_root)
+    samples = records.get("samples") or {}
+    summaries = []
+    for key, sample in sorted(samples.items(), key=record_sort_key):
+        if not isinstance(sample, dict):
+            continue
+        summaries.append(
+            {
+                "key": key,
+                "category": sample.get("category") or "",
+                "sample_id": sample.get("sample_id") or "",
+                "adjuster_name": sample.get("adjuster", {}).get("name") or "",
+                "self_rating": sample.get("adjuster", {}).get("rating") or "",
+                "self_rating_label": sample.get("adjuster", {}).get("rating_label") or RATING_LABELS.get(sample.get("adjuster", {}).get("rating"), ""),
+                "status": sample.get("status") or "",
+                "status_label": review_status_label(sample),
+                "reviewed": reviewed_for_current_cycle(sample),
+                "needs_review": needs_admin_review(sample),
+            }
+        )
+    return summaries
+
+
+def admin_sample_payload(submission_root: Path, index: int = 0, sample_key_value: str | None = None) -> dict:
+    records = load_records(submission_root)
+    samples = records.get("samples") or {}
+    summaries = admin_sample_summaries(submission_root)
+    if not summaries:
+        return {
+            "submission": str(submission_root),
+            "samples": [],
+            "current": None,
+            "index": 0,
+            "total": 0,
+            "reviewed_count": 0,
+        }
+    if sample_key_value:
+        index = next((cursor for cursor, item in enumerate(summaries) if item["key"] == sample_key_value), index)
+    index = max(0, min(int(index), len(summaries) - 1))
+    summary = summaries[index]
+    sample = samples.get(summary["key"]) or {}
+    category = str(sample.get("category") or "")
+    sample_name = str(sample.get("sample_id") or "")
+    layout_relative = sample.get("output_layout_dir") or f"Layout/{category}/{sample_name}/{OUTPUT_LAYOUT_LEVEL}"
+    layout_path = (submission_root / layout_relative).resolve()
+    if not path_is_within(layout_path, submission_root):
+        raise ValueError("Invalid sample layout path in records.")
+    mutiviews_dir = layout_path / "Mutiviews"
+    obj_o_dir = layout_path / "Obj-O"
+    images = {
+        view: str((mutiviews_dir / projection_filename(sample_name, view)).resolve())
+        for view in (*VIEW_ORDER, "combined")
+        if (mutiviews_dir / projection_filename(sample_name, view)).is_file()
+    }
+    obj_o_info = obj_o_info_from_dir(obj_o_dir, sample_name)
+    current = {
+        **summary,
+        "layout_path": str(layout_path),
+        "mutiviews_dir": str(mutiviews_dir),
+        "obj_o_dir": str(obj_o_dir),
+        "projection_images": images,
+        "obj_o_sources": {"output": obj_o_info},
+        "adjuster": sample.get("adjuster") or {},
+        "review": sample.get("review") or {},
+        "review_cycle": int(sample.get("review_cycle") or 0),
+        "history": sample.get("history") or [],
+    }
+    return {
+        "submission": {
+            "name": "." if submission_root == DATA_ADMIN_ROOT.resolve() else submission_root.name,
+            "path": str(submission_root),
+            "records_path": str(records_path(submission_root)),
+        },
+        "samples": summaries,
+        "current": current,
+        "index": index,
+        "total": len(summaries),
+        "reviewed_count": sum(1 for item in summaries if item["reviewed"]),
+        "pending_count": sum(1 for item in summaries if item["needs_review"]),
+    }
+
+
+def save_admin_review(submission_name: str, payload: dict) -> dict:
+    submission_root = admin_submission_root(submission_name)
+    key = str(payload.get("sample_key") or "").strip()
+    if not key:
+        raise ValueError("Missing sample key.")
+    rating = normalize_rating(payload.get("admin_rating"), "admin_rating")
+    remark = str(payload.get("admin_remark") or "").strip()
+    reviewer_name = str(payload.get("reviewer_name") or "").strip()
+    records = load_records(submission_root)
+    sample = records.get("samples", {}).get(key)
+    if not isinstance(sample, dict):
+        raise KeyError(f"Sample not found in records: {key}")
+    now = now_iso()
+    cycle = int(sample.get("review_cycle") or 0)
+    previous_status = str(sample.get("status") or "")
+    event = "rechecked" if previous_status == "pending_recheck" or cycle > 0 else "reviewed"
+    if event == "rechecked" and cycle <= 0:
+        cycle = 1
+    next_status = "changes_required" if rating == "bad" else "reviewed"
+    history_event = "changes_required" if rating == "bad" else event
+    sample["status"] = next_status
+    sample["review_cycle"] = cycle
+    sample["review"] = {
+        "reviewer_name": reviewer_name,
+        "rating": rating,
+        "rating_label": RATING_LABELS[rating],
+        "remark": remark,
+        "reviewed_at": now,
+    }
+    history = list(sample.get("history") or [])
+    history.append(
+        {
+            "event": history_event,
+            "label": record_event_label(history_event, cycle),
+            "at": now,
+            "actor": "admin",
+            "name": reviewer_name,
+            "rating": rating,
+            "remark": remark,
+            "cycle": cycle,
+        }
+    )
+    sample["history"] = history
+    records["samples"][key] = sample
+    save_records(submission_root, records)
+    return admin_sample_payload(submission_root, sample_key_value=key)
+
+
+def admin_records_download(submission_name: str) -> tuple[bytes, str]:
+    submission_root = admin_submission_root(submission_name)
+    path = records_path(submission_root)
+    if not path.is_file():
+        raise FileNotFoundError(f"Records file does not exist: {path}")
+    filename = f"{safe_stem(submission_root.name or 'admin')}_review_records_{datetime.now().strftime('%Y%m%d')}.json"
+    return path.read_bytes(), filename
+
+
+def export_admin_records_file(submission_name: str) -> dict:
+    data, filename = admin_records_download(submission_name)
+    result = save_export_file(data, filename)
+    result["kind"] = "review_records"
+    return result
 
 
 def json_response(handler: SimpleHTTPRequestHandler, payload: dict, status: int = 200) -> None:
@@ -1678,6 +2342,9 @@ class EditorHandler(SimpleHTTPRequestHandler):
         if parsed.path == "/":
             self.serve_static("index.html")
             return
+        if parsed.path == "/admin":
+            self.serve_static("admin.html")
+            return
         if parsed.path.startswith("/static/"):
             self.serve_static(parsed.path.removeprefix("/static/"))
             return
@@ -1685,7 +2352,16 @@ class EditorHandler(SimpleHTTPRequestHandler):
             json_response(self, current_state_payload())
             return
         if parsed.path == "/api/defaults":
-            json_response(self, {"dataset_root": str(DEFAULT_DATASET_ROOT), "output_root": str(DEFAULT_OUTPUT_ROOT), "temp_root": str(DATA_TEMP_ROOT)})
+            json_response(
+                self,
+                {
+                    "dataset_root": str(DEFAULT_DATASET_ROOT),
+                    "output_root": str(DEFAULT_OUTPUT_ROOT),
+                    "temp_root": str(DATA_TEMP_ROOT),
+                    "admin_root": str(DATA_ADMIN_ROOT),
+                    "records_filename": RECORDS_FILENAME,
+                },
+            )
             return
         if parsed.path == "/api/samples":
             query = parse_qs(parsed.query)
@@ -1695,10 +2371,38 @@ class EditorHandler(SimpleHTTPRequestHandler):
             output_root = Path(output_root_value) if output_root_value else DEFAULT_OUTPUT_ROOT
             json_response(self, list_annotation_samples(root, output_root))
             return
+        if parsed.path == "/api/admin/submissions":
+            json_response(self, list_admin_submissions())
+            return
+        if parsed.path == "/api/admin/sample":
+            query = parse_qs(parsed.query)
+            submission = unquote(query.get("submission", ["."])[0]).strip()
+            index = int(query.get("index", ["0"])[0] or 0)
+            key = unquote(query.get("key", [""])[0]).strip() or None
+            json_response(self, admin_sample_payload(admin_submission_root(submission), index, key))
+            return
+        if parsed.path == "/api/admin/export_records":
+            try:
+                query = parse_qs(parsed.query)
+                submission = unquote(query.get("submission", ["."])[0]).strip()
+                json_response(self, export_admin_records_file(submission))
+            except Exception as exc:
+                json_response(self, {"error": str(exc)}, status=500)
+            return
         if parsed.path == "/api/file":
             query = parse_qs(parsed.query)
             path = Path(unquote(query.get("path", [""])[0]))
             self.serve_file(path)
+            return
+        if parsed.path == "/api/export_zip":
+            try:
+                query = parse_qs(parsed.query)
+                output_root_value = unquote(query.get("output_root", [str(DEFAULT_OUTPUT_ROOT)])[0]).strip()
+                name_value = unquote(query.get("name", [""])[0]).strip()
+                output_root = Path(output_root_value) if output_root_value else DEFAULT_OUTPUT_ROOT
+                json_response(self, export_output_zip_file(output_root, name_value))
+            except Exception as exc:
+                json_response(self, {"error": str(exc)}, status=500)
             return
         self.send_error(404)
 
@@ -1715,6 +2419,7 @@ class EditorHandler(SimpleHTTPRequestHandler):
                             str(payload.get("category") or ""),
                             str(payload["sample_name"]),
                             payload.get("output_root") or None,
+                            start_from_output=bool(payload.get("start_from_output")),
                         ),
                     )
                 else:
@@ -1725,6 +2430,7 @@ class EditorHandler(SimpleHTTPRequestHandler):
                             payload.get("obj_p_path") or None,
                             payload.get("dataset_root") or None,
                             payload.get("output_root") or None,
+                            start_from_output=bool(payload.get("start_from_output")),
                         ),
                     )
                 return
@@ -1741,7 +2447,15 @@ class EditorHandler(SimpleHTTPRequestHandler):
                 return
             if parsed.path == "/api/save":
                 apply_update(payload)
-                json_response(self, save_current())
+                json_response(self, save_current(payload.get("metadata") or {}))
+                return
+            if parsed.path == "/api/import_review_records":
+                output = payload.get("output") or {}
+                output_root = Path(output.get("output_root") or DEFAULT_OUTPUT_ROOT)
+                json_response(self, merge_review_records(output_root, payload.get("records") or {}))
+                return
+            if parsed.path == "/api/admin/review":
+                json_response(self, save_admin_review(str(payload.get("submission") or "."), payload))
                 return
             if parsed.path == "/api/export_obj_o":
                 apply_update(payload)
@@ -1775,6 +2489,17 @@ class EditorHandler(SimpleHTTPRequestHandler):
         self.send_header("Content-Type", content_type)
         self.send_header("Cache-Control", "no-store")
         self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def serve_bytes(self, data: bytes, filename: str, content_type: str) -> None:
+        fallback = safe_stem(Path(filename).stem) + Path(filename).suffix
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("X-Export-Filename", quote(filename))
+        self.send_header("Content-Disposition", f"attachment; filename=\"{fallback}\"; filename*=UTF-8''{quote(filename)}")
         self.end_headers()
         self.wfile.write(data)
 

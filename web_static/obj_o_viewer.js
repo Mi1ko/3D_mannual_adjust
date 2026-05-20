@@ -5,7 +5,8 @@ import { OBJLoader } from "three/addons/loaders/OBJLoader.js";
 
 const canvas = document.getElementById("objOCanvas");
 const empty = document.getElementById("objOEmpty");
-const initialZoom = 1.15;
+const isAdminViewer = document.body?.classList.contains("admin-page");
+const initialZoom = isAdminViewer ? 1.45 : 1.15;
 
 let renderer = null;
 let scene = null;
@@ -39,11 +40,11 @@ function ensureViewer() {
   if (renderer) return true;
 
   renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: false });
-  renderer.setClearColor(0xf6f8fa, 1);
+  renderer.setClearColor(0xf7f9f7, 1);
   renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
 
   scene = new THREE.Scene();
-  scene.background = new THREE.Color(0xf6f8fa);
+  scene.background = new THREE.Color(0xf7f9f7);
   scene.add(new THREE.HemisphereLight(0xffffff, 0x9aa3ad, 1.7));
 
   const keyLight = new THREE.DirectionalLight(0xffffff, 1.9);

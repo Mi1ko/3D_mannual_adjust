@@ -22,12 +22,12 @@
 
 ### 什么时候需要点“保存完整结果”？
 
-当你确认当前布局可以作为人工微调结果时，填写名字并点击“保存完整结果”。这会把 annotation、五视角投影和五个朝向的 OBJ-O 写入 `data/output/Layout/<category>/<sample_id>/layout1`。
+当你确认当前布局可以作为人工微调结果时，填写名字、选择自评并点击“保存完整结果”。这会把 annotation、五视角投影、五个朝向的 OBJ-O 和微调记录写入 `data/output`。
 
 
 ### 目录结构
 
-建议直接将整个数据集切片放到input下然后把test删掉，在开始干活之前把output清空，然后在没有完成所有的之前都存到output里面，因为系统可以定位到最近未被微调的样本。
+建议直接将整个数据集切片放到 `data/input` 下。在开始新一批任务之前可以清空 `data/output`，本轮所有微调结果都保存到 `data/output`。审核人员收到微调者导出的 zip 后，解压到 `data/admin/<提交包名>` 下审核。
 
 ## 安装依赖
 
@@ -67,11 +67,11 @@ http://127.0.0.1:8780
 ```
 
 如果是在当前终端启动，按 `Ctrl+C` 停止。  
-如果是后台启动，可以用：
+如果是后台启动，可以按端口找到进程并停止：
 
 ```powershell
-$pid = Get-Content data\temp\manual_app.pid
-Stop-Process -Id $pid -Force
+$pid = Get-NetTCPConnection -LocalPort 8780 -State Listen | Select-Object -First 1 -ExpandProperty OwningProcess
+Stop-Process -Id $pid
 ```
 
 ## 默认目录
@@ -80,6 +80,8 @@ Stop-Process -Id $pid -Force
 data/
 ├── input/    # 输入数据，只读
 ├── output/   # 人工微调后的正式输出
+├── admin/    # 审核人员解压微调者提交 zip 的目录
+├── export/   # 本地导出目录，导出的 zip 和审核记录会写到这里
 └── temp/     # 生成投影时的临时文件
 ```
 
@@ -96,6 +98,8 @@ data/output
 ```
 
 加载样本时不会修改 `data/input` 下的任何文件。
+
+`data/output/manual_adjust_records.json` 是微调记录文件，不属于原始数据集结构，但会随导出 zip 一起给审核人员使用。审核人员导出的审核记录也会写到 `data/export`。
 
 ## 输入数据结构
 
@@ -145,7 +149,7 @@ data/input/
 
 ## 加载样本
 
-打开网页后，程序会扫描输入目录，并自动加载第一个还没有完整人工微调输出的样本。
+打开网页后，程序会扫描输入目录，并自动加载第一个样本。样本下拉框会显示当前状态，可用“状态筛选”只看某一类样本；切换状态筛选后会自动加载筛选后的第一个样本。
 
 加载样本时只做这些事情：
 
@@ -155,6 +159,11 @@ data/input/
 - 读取 input 中已有的 `Obj-O` 用于 OBJ-O 预览。
 
 加载阶段不会重新渲染投影，也不会生成临时 OBJ-O，因此速度应该主要取决于读取文件和加载网页资源。
+
+页面提供两个加载入口：
+
+- `从 input 加载`：从 `data/input` 的 layout2 结果开始微调。
+- `从 output 加载`：从 `data/output` 已保存的 layout1 微调结果继续微调，适合二次调整或审核后返修。
 
 ## 相机参数
 
@@ -184,6 +193,8 @@ data/input/
 - `+z / -z`
 
 可以用按钮、滑条或坐标输入框移动。移动后只记录在页面内存中，不会立即写 JSON，也不会自动生成投影。
+
+页面支持“上一步/下一步”撤销和重做。撤销历史只保存在当前样本的页面内存里，切换样本或刷新网页后会重置。
 
 五视角图上会显示：
 
@@ -248,7 +259,13 @@ data/temp/preview_projection/<category>/<sample_id>/
 
 ## 保存完整结果
 
-保存前必须填写名字。点击“保存完整结果”后，结果写入输出目录：
+保存前必须填写名字并选择自评。自评分为：
+
+- `好`
+- `中`
+- `差`
+
+备注可选，用来说明本次微调的疑点或希望审核重点关注的地方。点击“保存完整结果”后，结果写入输出目录：
 
 ```text
 data/output/
@@ -286,17 +303,91 @@ data/output/
 
 如果 output 中已经存在该样本的完整人工微调结果，页面顶部样本标题会出现黄色高亮，提醒你确认是否要重新微调。
 
+保存还会更新：
+
+```text
+data/output/manual_adjust_records.json
+```
+
+该文件记录微调者姓名、自评、备注、审核结果、状态和历史时间线。它不是数据集本身的一部分，但会随导出 zip 一起交给审核人员。
+
+## 状态和记录文件
+
+样本状态统一记录在 `manual_adjust_records.json` 中：
+
+- 无状态：还没有微调记录。
+- `已微调待审核`：微调人员保存过结果，等待首次审核。
+- `已微调并审核`：审核人员已审核通过或给出非差评价。
+- `已审核需修改`：审核人员评价为差，需要微调人员返修。
+- `已微调待复核N`：微调人员在审核后再次保存，等待第 N 次复核。
+
+审核文件导入时只覆盖重复样本的审核相关字段，不会整体覆盖本地记录文件。这样微调人员在审核文件导出后继续工作的进度不会被整份旧审核文件抹掉。
+
+如果 output 中有旧版微调结果，但没有 `manual_adjust_records.json`，点击“导出全部 ZIP”时会自动初始化记录文件：扫描 `data/output/Layout/*/*/layout1/Annotation/*.json`，把这些样本记录为 `已微调待审核`，微调者姓名使用页面里填写的名字，自评统一为 `未知`。
+
+## 导出与提交
+
+微调页面点击“导出全部 ZIP”后，不会触发浏览器下载。程序会把 zip 写入本地目录：
+
+```text
+data/export/<名字>_<YYYYMMDD>.zip
+```
+
+导出成功后页面会弹窗显示完整路径。zip 内容来自 `data/output`，不会包含旧版 preview 文件夹；`manual_adjust_records.json` 会一并导出。
+
+如果同名文件已存在，程序会自动追加 `_2`、`_3`，避免覆盖已有导出。
+
+## 审核流程
+
+审核页面地址：
+
+```text
+http://127.0.0.1:8780/admin
+```
+
+审核人员收到微调者的 zip 后，先解压到：
+
+```text
+data/admin/<提交包名>/
+```
+
+解压后的目录应直接包含 `manual_adjust_records.json` 和 `Layout/`。admin 页面会扫描 `data/admin` 下所有带记录文件的提交包。
+
+admin 页面会显示：
+
+- 微调者姓名。
+- 微调者自评和备注。
+- 当前状态和已审查数量。
+- OBJ-O 预览和五个视角投影。
+- 审核评价、审核备注和历史记录。
+
+审核评价分为 `好`、`中`、`差`。保存审核后：
+
+- `好` 或 `中`：状态变为 `已微调并审核`。
+- `差`：状态变为 `已审核需修改`。
+
+admin 页面点击“导出审核文件”后，也不会触发浏览器下载，而是写入：
+
+```text
+data/export/<提交包名>_review_records_<YYYYMMDD>.json
+```
+
+微调人员拿到这个审核记录 JSON 后，在微调页面点击“导入审核文件”。导入后页面会显示审核评价、审核状态和审核备注，并可通过状态筛选快速找到需要修改的样本。
+
 ## 不会修改 input 的操作
 
 以下操作都不会修改 input：
 
 - 加载样本。
+- 按状态筛选样本。
+- 从 input 或 output 加载样本。
 - 切换标签或锚点。
 - 移动标签或锚点。
 - 点击“生成投影”。
 - 切换 OBJ-O 预览状态或视角。
+- 导入审核文件。导入审核文件只修改 `data/output/manual_adjust_records.json`。
 
-只有点击“保存完整结果”才会写入 `data/output`。
+点击“保存完整结果”会写入 `data/output/Layout/.../layout1` 并更新 `data/output/manual_adjust_records.json`。点击“导出全部 ZIP”会写入 `data/export`。
 
 ## 临时目录
 
@@ -306,12 +397,7 @@ data/output/
 data/temp/
 ├── preview_obj_o/          # 生成投影时的临时 OBJ-O
 ├── preview_projection/     # 生成投影时的临时五视角图片
-├── part_overlays/          # 旧版/调试用部件覆盖图缓存
-├── manual_app.pid          # 后台进程 PID
-├── manual_app.stdout.log   # 后台日志
-└── manual_app.stderr.log   # 后台错误日志
+└── part_overlays/          # 旧版/调试用部件覆盖图缓存
 ```
 
 清理 `preview_obj_o` 和 `preview_projection` 不会影响 input 或 output；之后点击“生成投影”会重新生成。
-
-

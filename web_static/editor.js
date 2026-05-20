@@ -1,5 +1,6 @@
 const appState = {
   data: null,
+  allSamples: [],
   samples: [],
   selectedSample: null,
   selectedIndex: 0,
@@ -14,6 +15,12 @@ const appState = {
   tempObjOStale: true,
   baselineAnnotationPath: "",
   targetBaselines: new Map(),
+  undoStack: [],
+  redoStack: [],
+  pendingHistorySnapshot: null,
+  historyRestoring: false,
+  historyLimit: 80,
+  sampleStatusFilter: "all",
 };
 
 const viewIds = { main: "imgMain", up: "imgUp", down: "imgDown", left: "imgLeft", right: "imgRight" };
@@ -24,7 +31,7 @@ const axisInputs = ["camX", "camY", "camZ"];
 const sliderIds = ["sliderX", "sliderY", "sliderZ"];
 const axisNames = ["x", "y", "z"];
 const axisColors = { "+x": "#d94733", "+y": "#2368b8", "+z": "#218354" };
-const manualOutputSuffix = "\uff08\u5df2\u6709\u5fae\u8c03\uff09";
+const ratingLabels = { good: "好", medium: "中", bad: "差", unknown: "未知" };
 const minVisibleMove = 0.12;
 const moveTraceMinDistance = 1e-4;
 const objOSourceLabels = { input: "输入状态", output: "输出状态", temp: "微调中" };
@@ -33,7 +40,42 @@ const viewLabels = { main: "主视角", up: "上视角", down: "下视角", left
 const $ = (id) => document.getElementById(id);
 
 function sampleOptionText(sample) {
-  return `${sample.display_name || sample.name}${sample.manual_output_complete ? manualOutputSuffix : ""}`;
+  const suffixes = [];
+  if (sample.review_status_label) suffixes.push(`（${sample.review_status_label}）`);
+  if (sample.self_rating === "bad") suffixes.push("（自评差）");
+  return `${sample.display_name || sample.name}${suffixes.join("")}`;
+}
+
+function statusFilterValue() {
+  return $("sampleStatusFilter")?.value || appState.sampleStatusFilter || "all";
+}
+
+function sampleMatchesStatusFilter(sample, filter = statusFilterValue()) {
+  const status = sample?.review_status || "";
+  if (filter === "all") return true;
+  if (filter === "none") return !status;
+  if (filter === "pending_recheck") return status === "pending_recheck";
+  return status === filter;
+}
+
+function renderSampleOptions(preferredAnnotationPath = "") {
+  const sampleSelect = $("sampleSelect");
+  if (!sampleSelect) return null;
+  appState.sampleStatusFilter = statusFilterValue();
+  appState.samples = appState.allSamples.filter((sample) => sampleMatchesStatusFilter(sample, appState.sampleStatusFilter));
+  sampleSelect.innerHTML = "";
+  for (const sample of appState.samples) {
+    const option = document.createElement("option");
+    option.value = sample.annotation_path;
+    option.textContent = sampleOptionText(sample);
+    sampleSelect.appendChild(option);
+  }
+  const selected =
+    appState.samples.find((sample) => sample.annotation_path === preferredAnnotationPath) ||
+    appState.samples[0] ||
+    null;
+  if (selected) sampleSelect.value = selected.annotation_path;
+  return selected;
 }
 
 function refreshSampleOption(sample) {
@@ -219,6 +261,128 @@ function clonePoint(point) {
   return Array.isArray(point) ? point.map(Number) : null;
 }
 
+function samePoint(a, b) {
+  if (!a && !b) return true;
+  if (!a || !b || a.length !== b.length) return false;
+  return a.every((value, index) => Math.abs(Number(value) - Number(b[index])) <= 1e-9);
+}
+
+function positionSnapshot() {
+  if (!appState.data?.loaded) return null;
+  return {
+    selectedIndex: appState.selectedIndex,
+    selectedKind: appState.selectedKind,
+    groups: (appState.data.groups || []).map((group) => ({
+      index: group.index,
+      label_camera_center: clonePoint(group.label_camera_center),
+      label_world_center: clonePoint(group.label_world_center),
+      anchor_camera_center: clonePoint(group.anchor_camera_center),
+      anchor_world: clonePoint(group.anchor_world),
+    })),
+  };
+}
+
+function snapshotsEqual(a, b) {
+  if (!a || !b) return true;
+  if ((a.groups || []).length !== (b.groups || []).length) return false;
+  return (a.groups || []).every((group, index) => {
+    const other = b.groups[index];
+    return (
+      other &&
+      Number(group.index) === Number(other.index) &&
+      samePoint(group.label_camera_center, other.label_camera_center) &&
+      samePoint(group.label_world_center, other.label_world_center) &&
+      samePoint(group.anchor_camera_center, other.anchor_camera_center) &&
+      samePoint(group.anchor_world, other.anchor_world)
+    );
+  });
+}
+
+function updateHistoryButtons() {
+  const undoButton = $("undoBtn");
+  const redoButton = $("redoBtn");
+  if (undoButton) undoButton.disabled = !appState.undoStack.length;
+  if (redoButton) redoButton.disabled = !appState.redoStack.length;
+}
+
+function resetPositionHistory() {
+  appState.undoStack = [];
+  appState.redoStack = [];
+  appState.pendingHistorySnapshot = null;
+  updateHistoryButtons();
+}
+
+function pushPositionHistory(beforeSnapshot) {
+  if (appState.historyRestoring || !beforeSnapshot) return;
+  const afterSnapshot = positionSnapshot();
+  if (!afterSnapshot || snapshotsEqual(beforeSnapshot, afterSnapshot)) return;
+  appState.undoStack.push(beforeSnapshot);
+  if (appState.undoStack.length > appState.historyLimit) appState.undoStack.shift();
+  appState.redoStack = [];
+  updateHistoryButtons();
+}
+
+function beginPositionHistory() {
+  if (appState.historyRestoring || appState.pendingHistorySnapshot || !appState.data?.loaded) return;
+  appState.pendingHistorySnapshot = positionSnapshot();
+}
+
+function commitPositionHistory() {
+  const beforeSnapshot = appState.pendingHistorySnapshot;
+  appState.pendingHistorySnapshot = null;
+  pushPositionHistory(beforeSnapshot);
+}
+
+function restorePositionSnapshot(snapshot, message) {
+  if (!snapshot || !appState.data?.loaded) return;
+  appState.historyRestoring = true;
+  try {
+    for (const savedGroup of snapshot.groups || []) {
+      const group = (appState.data.groups || [])[Number(savedGroup.index)];
+      if (!group) continue;
+      group.label_camera_center = clonePoint(savedGroup.label_camera_center);
+      group.label_world_center = clonePoint(savedGroup.label_world_center);
+      group.anchor_camera_center = clonePoint(savedGroup.anchor_camera_center);
+      group.anchor_world = clonePoint(savedGroup.anchor_world);
+    }
+    appState.selectedIndex = Math.min(Math.max(Number(snapshot.selectedIndex || 0), 0), Math.max(0, (appState.data.groups || []).length - 1));
+    appState.selectedKind = snapshot.selectedKind === "anchor" ? "anchor" : "label";
+    const targetKindInput = document.querySelector(`input[name="targetKind"][value="${appState.selectedKind}"]`);
+    if (targetKindInput) targetKindInput.checked = true;
+    window.clearTimeout(appState.anchorSnapTimer);
+    appState.anchorSnapPending = false;
+    appState.dirty = true;
+    appState.tempObjOStale = true;
+    renderTargetSelector();
+    renderSelectedTarget();
+    updateObjOSourceSelect(appState.data);
+    if (selectedObjOSource() === "temp") refreshObjOPreview(appState.data, true);
+    setStatus(message);
+  } finally {
+    appState.historyRestoring = false;
+  }
+}
+
+function undoPosition() {
+  commitPositionHistory();
+  if (!appState.undoStack.length) return;
+  const currentSnapshot = positionSnapshot();
+  const previousSnapshot = appState.undoStack.pop();
+  if (currentSnapshot) appState.redoStack.push(currentSnapshot);
+  restorePositionSnapshot(previousSnapshot, "已回到上一步移动。");
+  updateHistoryButtons();
+}
+
+function redoPosition() {
+  commitPositionHistory();
+  if (!appState.redoStack.length) return;
+  const currentSnapshot = positionSnapshot();
+  const nextSnapshot = appState.redoStack.pop();
+  if (currentSnapshot) appState.undoStack.push(currentSnapshot);
+  restorePositionSnapshot(nextSnapshot, "已恢复下一步移动。");
+  updateHistoryButtons();
+}
+
 function captureTargetBaselines(data, force = false) {
   if (!data?.loaded) return;
   if (!force && appState.baselineAnnotationPath === data.annotation_path && appState.targetBaselines.size) return;
@@ -349,6 +513,7 @@ function primeMoveSlider(slider) {
 }
 
 function applyMoveSlider(slider) {
+  beginPositionHistory();
   const axis = Number(slider.dataset.axis);
   if (!slider.dataset.base) primeMoveSlider(slider);
   const base = Number(slider.dataset.base || 0);
@@ -364,10 +529,19 @@ function finishMoveSlider(slider) {
   const axis = Number(slider.dataset.axis);
   slider.dataset.base = String(Number($(axisInputs[axis]).value || 0));
   slider.value = "0";
+  commitPositionHistory();
 }
 
 function editorNameValue() {
   return $("editorName")?.value.trim() || "";
+}
+
+function selfRatingValue() {
+  return $("selfRating")?.value || "";
+}
+
+function adjusterRemarkValue() {
+  return $("adjusterRemark")?.value.trim() || "";
 }
 
 function selectedObjOView() {
@@ -439,15 +613,32 @@ function requireEditorName(actionLabel = "保存") {
   return false;
 }
 
+function requireSelfRating(actionLabel = "保存") {
+  if (selfRatingValue()) return true;
+  $("selfRating")?.focus();
+  updateSaveButtons(appState.data);
+  setStatus(`请先选择自评（好/中/差），再${actionLabel}。`, true);
+  return false;
+}
+
 function outputPayload() {
   return { output_root: $("outputRoot").value.trim() };
 }
 
-function payloadFromState() {
+function metadataPayload() {
+  return {
+    self_rating: selfRatingValue(),
+    adjuster_remark: adjusterRemarkValue(),
+  };
+}
+
+function payloadFromState(options = {}) {
   syncSelectedFromInputs();
+  if (options.commitHistory) commitPositionHistory();
   return {
     editor_name: editorNameValue(),
     output: outputPayload(),
+    metadata: metadataPayload(),
     groups: (appState.data?.groups || []).map((group) => ({
       index: group.index,
       label_camera_center: group.label_camera_center.map(Number),
@@ -462,17 +653,10 @@ async function refreshSamples(options = {}) {
     const root = $("datasetRoot").value.trim();
     const outputRoot = $("outputRoot").value.trim();
     const data = await getJson(`/api/samples?root=${encodeURIComponent(root)}&output_root=${encodeURIComponent(outputRoot)}`);
-    appState.samples = data.samples || [];
-    const sampleSelect = $("sampleSelect");
-    sampleSelect.innerHTML = "";
-    for (const sample of appState.samples) {
-      const option = document.createElement("option");
-      option.value = sample.annotation_path;
-      option.textContent = sampleOptionText(sample);
-      sampleSelect.appendChild(option);
-    }
+    appState.allSamples = data.samples || [];
+    const selected = renderSampleOptions();
     if (appState.samples.length) {
-      const firstOpen = appState.samples.find((sample) => !sample.manual_output_complete) || appState.samples[0];
+      const firstOpen = appState.samples.find((sample) => !sample.review_status) || selected;
       selectSample(firstOpen.annotation_path);
       finishStageToast("文件列表刷新完成");
       if (options.autoLoad) {
@@ -481,8 +665,9 @@ async function refreshSamples(options = {}) {
     } else {
       appState.selectedSample = null;
       $("sampleTitle").textContent = "未找到样本";
-      setStatus("输入根目录下没有找到 Annotation JSON。", true);
-      finishStageToast("没有找到可加载的样本", true);
+      const hasAnySamples = appState.allSamples.length > 0;
+      setStatus(hasAnySamples ? "当前状态筛选下没有样本。" : "输入根目录下没有找到 Annotation JSON。", true);
+      finishStageToast(hasAnySamples ? "当前筛选无样本" : "没有找到可加载的样本", true);
     }
   } catch (error) {
     finishStageToast(error.message || String(error), true);
@@ -494,36 +679,34 @@ async function refreshSamplesPreservingCurrent(preferredAnnotationPath) {
   const root = $("datasetRoot").value.trim();
   const outputRoot = $("outputRoot").value.trim();
   const data = await getJson(`/api/samples?root=${encodeURIComponent(root)}&output_root=${encodeURIComponent(outputRoot)}`);
-  appState.samples = data.samples || [];
-  const sampleSelect = $("sampleSelect");
-  sampleSelect.innerHTML = "";
-  for (const sample of appState.samples) {
-    const option = document.createElement("option");
-    option.value = sample.annotation_path;
-    option.textContent = sampleOptionText(sample);
-    sampleSelect.appendChild(option);
-  }
-  const matched = appState.samples.find((item) => item.annotation_path === preferredAnnotationPath);
+  appState.allSamples = data.samples || [];
+  renderSampleOptions(preferredAnnotationPath);
+  const matched = appState.allSamples.find((item) => item.annotation_path === preferredAnnotationPath);
   if (matched) {
     appState.selectedSample = matched;
-    sampleSelect.value = matched.annotation_path;
+    if (sampleMatchesStatusFilter(matched) && $("sampleSelect")) $("sampleSelect").value = matched.annotation_path;
     $("annotationPath").value = matched.annotation_path || "";
     $("objPath").value = matched.obj_p_path || "";
+    updateLoadButtons();
   }
 }
 
 function selectSample(annotationPath) {
-  appState.selectedSample = appState.samples.find((item) => item.annotation_path === annotationPath) || null;
+  appState.selectedSample = appState.allSamples.find((item) => item.annotation_path === annotationPath) || null;
   if (!appState.selectedSample) return;
   $("sampleSelect").value = annotationPath;
   $("annotationPath").value = appState.selectedSample.annotation_path || "";
   $("objPath").value = appState.selectedSample.obj_p_path || "";
+  if ($("adminRatingText")) $("adminRatingText").value = appState.selectedSample.admin_rating_label || ratingLabels[appState.selectedSample.admin_rating] || "";
+  if ($("reviewStatusText")) $("reviewStatusText").value = appState.selectedSample.review_status_label || "";
+  if ($("adminRemarkText")) $("adminRemarkText").value = "";
   const currentOutput = $("outputRoot").value.trim();
   if (!currentOutput) {
     $("outputRoot").value = appState.data?.output_root || "";
   }
   $("sampleTitle").textContent = appState.selectedSample.display_name || appState.selectedSample.name;
-  setStatus("已选择样本，点击“加载”。");
+  updateLoadButtons();
+  setStatus("已选择样本，可以从 input 加载；如已有微调结果，也可以从 output 加载。");
 }
 
 function renderCamera(camera) {
@@ -829,9 +1012,15 @@ function renderViewGuides() {
 
 function renderState(data, options = {}) {
   appState.data = data;
+  if (options.resetHistory) resetPositionHistory();
   if (!data.loaded) {
+    if ($("adminRatingText")) $("adminRatingText").value = "";
+    if ($("reviewStatusText")) $("reviewStatusText").value = "";
+    if ($("adminRemarkText")) $("adminRemarkText").value = "";
     refreshObjOPreview(data, Boolean(options.forceObjPreview));
     renderExistingOutputNotice(data);
+    updateLoadButtons();
+    updateSaveButtons(data);
     setStatus("还没有加载 JSON。", true);
     return;
   }
@@ -839,17 +1028,29 @@ function renderState(data, options = {}) {
 
   $("datasetRoot").value = data.dataset_root || $("datasetRoot").value;
   if (data.annotation_path && $("sampleSelect")) {
-    const matched = appState.samples.find((item) => item.annotation_path === data.annotation_path);
+    const matched = appState.allSamples.find((item) => item.annotation_path === data.annotation_path);
     if (matched) {
       matched.manual_output_complete = Boolean(data.manual_output_complete);
       matched.manual_output_layout_dir = data.manual_output_info?.layout_dir || matched.manual_output_layout_dir;
+      matched.review_status = data.review_status || "";
+      matched.review_status_label = data.review_status_label || "";
+      matched.reviewed = Boolean(data.reviewed);
+      matched.self_rating = data.self_rating || "";
+      matched.admin_rating = data.admin_rating || "";
+      matched.admin_rating_label = data.admin_rating_label || "";
       appState.selectedSample = matched;
-      refreshSampleOption(matched);
-      $("sampleSelect").value = data.annotation_path;
+      renderSampleOptions(data.annotation_path);
+      if (sampleMatchesStatusFilter(matched)) $("sampleSelect").value = data.annotation_path;
     }
   }
   const stateOutput = data.output_root || $("outputRoot").value || data.dataset_root || "";
   $("outputRoot").value = stateOutput;
+  if (data.editor_name && $("editorName")) $("editorName").value = data.editor_name;
+  if ($("selfRating")) $("selfRating").value = data.self_rating || "";
+  if ($("adjusterRemark")) $("adjusterRemark").value = data.adjuster_remark || "";
+  if ($("adminRatingText")) $("adminRatingText").value = data.admin_rating_label || ratingLabels[data.admin_rating] || "";
+  if ($("reviewStatusText")) $("reviewStatusText").value = data.review_status_label || "";
+  if ($("adminRemarkText")) $("adminRemarkText").value = data.admin_remark || "";
   $("annotationPath").value = data.annotation_path || "";
   $("objPath").value = data.obj_p_path || "";
   $("sampleTitle").textContent = data.annotation_path?.split(/[\\/]/).slice(-3).join(" / ") || "已加载";
@@ -868,6 +1069,7 @@ function renderState(data, options = {}) {
 
 function selectTarget(index) {
   syncSelectedFromInputs();
+  commitPositionHistory();
   appState.selectedIndex = Number(index);
   renderTargetSelector();
   renderSelectedTarget();
@@ -890,19 +1092,36 @@ function refreshObjOPreview(data, force = false) {
 
 window.addEventListener("obj-o-viewer-ready", () => refreshObjOPreview(appState.data));
 
+function updateLoadButtons() {
+  const adjustedButton = $("loadAdjustedBtn");
+  if (!adjustedButton) return;
+  const hasAdjustedOutput = Boolean(appState.selectedSample?.manual_output_complete || appState.data?.manual_output_complete);
+  adjustedButton.disabled = !hasAdjustedOutput;
+  adjustedButton.title = hasAdjustedOutput ? "从 output/layout1 的结果继续微调" : "当前样本还没有完整的 output 微调结果";
+}
+
 function updateSaveButtons(data) {
   const nameInput = $("editorName");
+  const ratingSelect = $("selfRating");
   const saveButton = $("saveBtn");
+  const exportButton = $("exportZipBtn");
   const hasName = Boolean(editorNameValue());
+  const hasRating = Boolean(selfRatingValue());
   const available = Boolean(data?.text_objs_available);
   if (nameInput) {
     nameInput.classList.toggle("required-missing", !hasName);
     nameInput.setAttribute("aria-invalid", hasName ? "false" : "true");
   }
+  if (ratingSelect) {
+    ratingSelect.classList.toggle("required-missing", !hasRating);
+    ratingSelect.setAttribute("aria-invalid", hasRating ? "false" : "true");
+  }
   if (saveButton) {
-    saveButton.disabled = !hasName || !available;
+    saveButton.disabled = !hasName || !hasRating || !available;
     if (!hasName) {
       saveButton.title = "请先输入名字";
+    } else if (!hasRating) {
+      saveButton.title = "请先选择自评（好/中/差）";
     } else if (!available) {
       const missing = (data?.missing_text_objs || []).slice(0, 4).join(", ");
       saveButton.title = missing ? `缺少文字 OBJ: ${missing}` : "未找到 Text_objs";
@@ -910,6 +1129,12 @@ function updateSaveButtons(data) {
       saveButton.title = "保存 Annotation、Mutiviews 和 Obj-O";
     }
   }
+  if (exportButton) {
+    exportButton.disabled = !hasName;
+    exportButton.title = hasName ? "下载 output 和 preview 预览图 ZIP" : "请先输入名字";
+  }
+  updateLoadButtons();
+  updateHistoryButtons();
 }
 
 function updateObjOButton(data) {
@@ -918,13 +1143,14 @@ function updateObjOButton(data) {
 
 function selectTargetKind(kind) {
   syncSelectedFromInputs();
+  commitPositionHistory();
   appState.selectedKind = kind;
   renderTargetSelector();
   renderSelectedTarget();
   setStatus("已切换标签/锚点；移动会记录在页面中，点击“生成投影”后再更新投影。");
 }
 
-async function loadAnnotation() {
+async function loadAnnotation(options = {}) {
   try {
     if (!appState.selectedSample) {
       setStatus("请先选择样本。", true);
@@ -932,25 +1158,32 @@ async function loadAnnotation() {
     }
     showStageToast("正在加载样本...");
     window.clearObjOPreview?.();
+    const startFromOutput = Boolean(options.startFromOutput);
+    if (startFromOutput && !appState.selectedSample.manual_output_complete) {
+      setStatus("当前样本还没有完整的 output 微调结果。", true);
+      finishStageToast("当前样本还没有完整的 output 微调结果", true);
+      return;
+    }
     setStatus("正在加载 JSON...");
     const data = await postJson("/api/load", {
       annotation_json: appState.selectedSample.annotation_path,
       obj_p_path: appState.selectedSample.obj_p_path || null,
       dataset_root: $("datasetRoot").value.trim(),
       output_root: $("outputRoot").value.trim(),
+      start_from_output: startFromOutput,
     });
     appState.selectedIndex = 0;
     appState.selectedKind = "label";
-    appState.objOSource = "input";
+    appState.objOSource = startFromOutput ? "output" : "input";
     appState.objOView = "main";
     appState.tempObjOStale = true;
     appState.baselineAnnotationPath = "";
     appState.targetBaselines = new Map();
-    if ($("objOSourceSelect")) $("objOSourceSelect").value = "input";
+    if ($("objOSourceSelect")) $("objOSourceSelect").value = appState.objOSource;
     if ($("objOViewSelect")) $("objOViewSelect").value = "main";
     document.querySelector('input[name="targetKind"][value="label"]').checked = true;
-    renderState(data);
-    finishStageToast("样本加载完成");
+    renderState(data, { resetHistory: true, forceObjPreview: startFromOutput });
+    finishStageToast(startFromOutput ? "已从 output 加载" : "已从 input 加载");
   } catch (error) {
     finishStageToast(error.message || String(error), true);
     setStatus(error.message || String(error), true);
@@ -962,10 +1195,11 @@ async function renderProjection(endpoint = "/api/render") {
   try {
     const isSave = endpoint === "/api/save";
     if (isSave && !requireEditorName("保存完整结果")) return;
+    if (isSave && !requireSelfRating("保存完整结果")) return;
     window.clearTimeout(appState.selectionRenderTimer);
     showStageToast(isSave ? "正在保存完整结果..." : "正在生成投影...");
     setStatus(isSave ? "正在保存 Annotation、Mutiviews 和 Obj-O..." : "正在生成五个预览投影，请稍等...");
-    const data = await postJson(endpoint, payloadFromState());
+    const data = await postJson(endpoint, payloadFromState({ commitHistory: true }));
     if (!isSave) appState.tempObjOStale = false;
     appState.objOSource = isSave ? "output" : "temp";
     if ($("objOSourceSelect")) $("objOSourceSelect").value = appState.objOSource;
@@ -980,11 +1214,67 @@ async function renderProjection(endpoint = "/api/render") {
   }
 }
 
+async function downloadExportZip() {
+  try {
+    if (!requireEditorName("导出 ZIP")) return;
+    const outputRoot = $("outputRoot").value.trim();
+    if (!outputRoot) {
+      setStatus("请先填写输出根目录。", true);
+      return;
+    }
+    showStageToast("正在准备导出 ZIP...");
+    const params = new URLSearchParams({ output_root: outputRoot, name: editorNameValue() });
+    const response = await fetch(`/api/export_zip?${params.toString()}`);
+    const text = await response.text();
+    if (!response.ok) {
+      try {
+        const data = JSON.parse(text);
+        throw new Error(data.error || text);
+      } catch (error) {
+        if (error instanceof SyntaxError) throw new Error(text);
+        throw error;
+      }
+    }
+    const result = JSON.parse(text);
+    finishStageToast("ZIP 已导出到本地");
+    setStatus(`已导出 ZIP：${result.path}`);
+    window.alert(`导出成功，文件已保存到：\n${result.path}`);
+  } catch (error) {
+    finishStageToast(error.message || String(error), true);
+    setStatus(error.message || String(error), true);
+  }
+}
+
+async function importReviewRecords(file) {
+  if (!file) return;
+  try {
+    showStageToast("正在导入审核文件...");
+    const text = await file.text();
+    const records = JSON.parse(text);
+    const result = await postJson("/api/import_review_records", {
+      output: outputPayload(),
+      records,
+    });
+    await refreshSamplesPreservingCurrent(appState.data?.annotation_path || appState.selectedSample?.annotation_path);
+    const state = await getJson("/api/state");
+    renderState(state);
+    finishStageToast(`审核文件导入完成：合并 ${result.merged} 个样本`);
+    setStatus(`已导入审核文件，合并 ${result.merged} 个重复样本，跳过 ${result.skipped} 个。`);
+  } catch (error) {
+    finishStageToast(error.message || String(error), true);
+    setStatus(error.message || String(error), true);
+  } finally {
+    if ($("reviewFileInput")) $("reviewFileInput").value = "";
+  }
+}
+
 function nudge(axis, delta) {
+  const beforeSnapshot = positionSnapshot();
   const step = numberValue("stepSize");
   const target = $(axisInputs[axis]);
   target.value = (Number(target.value || 0) + Number(delta) * step).toFixed(6);
   syncSelectedFromInputs();
+  pushPositionHistory(beforeSnapshot);
   resetMoveSliders();
   markDirty();
   scheduleAnchorSnap();
@@ -992,13 +1282,33 @@ function nudge(axis, delta) {
 
 function initEvents() {
   $("refreshSamples").addEventListener("click", () => refreshSamples({ autoLoad: true }));
+  $("sampleStatusFilter")?.addEventListener("change", async () => {
+    const preferred = appState.selectedSample?.annotation_path || appState.data?.annotation_path || "";
+    const selected = renderSampleOptions(preferred);
+    if (selected) {
+      selectSample(selected.annotation_path);
+      await loadAnnotation();
+    } else {
+      appState.selectedSample = null;
+      $("sampleTitle").textContent = "当前筛选无样本";
+      $("annotationPath").value = "";
+      $("objPath").value = "";
+      setStatus("当前状态筛选下没有样本。", true);
+    }
+  });
   $("sampleSelect").addEventListener("change", async (event) => {
     selectSample(event.target.value);
     await loadAnnotation();
   });
   $("loadBtn").addEventListener("click", loadAnnotation);
+  $("loadAdjustedBtn")?.addEventListener("click", () => loadAnnotation({ startFromOutput: true }));
+  $("undoBtn")?.addEventListener("click", undoPosition);
+  $("redoBtn")?.addEventListener("click", redoPosition);
   $("renderBtn").addEventListener("click", () => renderProjection("/api/render"));
   $("saveBtn").addEventListener("click", () => renderProjection("/api/save"));
+  $("exportZipBtn")?.addEventListener("click", downloadExportZip);
+  $("importReviewBtn")?.addEventListener("click", () => $("reviewFileInput")?.click());
+  $("reviewFileInput")?.addEventListener("change", (event) => importReviewRecords(event.target.files?.[0]));
   $("objOSourceSelect")?.addEventListener("change", (event) => {
     appState.objOSource = event.target.value;
     updateObjOUpdateHint();
@@ -1017,12 +1327,16 @@ function initEvents() {
   }
 
   for (const id of ["camX", "camY", "camZ"]) {
+    $(id).addEventListener("focus", beginPositionHistory);
     $(id).addEventListener("input", () => {
+      beginPositionHistory();
       syncSelectedFromInputs();
       resetMoveSliders();
       markDirty();
       scheduleAnchorSnap();
     });
+    $(id).addEventListener("change", commitPositionHistory);
+    $(id).addEventListener("blur", commitPositionHistory);
   }
   $("stepSize").addEventListener("input", renderViewGuides);
   $("outputRoot").addEventListener("input", () => markDirty(false));
@@ -1030,14 +1344,25 @@ function initEvents() {
     markDirty(false);
     updateSaveButtons(appState.data);
   });
+  $("selfRating")?.addEventListener("change", () => {
+    markDirty(false);
+    updateSaveButtons(appState.data);
+  });
+  $("adjusterRemark")?.addEventListener("input", () => markDirty(false));
   for (const button of document.querySelectorAll(".move-toolbar button[data-axis]")) {
     button.addEventListener("click", () => nudge(Number(button.dataset.axis), Number(button.dataset.delta)));
   }
   for (const id of sliderIds) {
     const slider = $(id);
     if (!slider) continue;
-    slider.addEventListener("pointerdown", () => primeMoveSlider(slider));
-    slider.addEventListener("focus", () => primeMoveSlider(slider));
+    slider.addEventListener("pointerdown", () => {
+      beginPositionHistory();
+      primeMoveSlider(slider);
+    });
+    slider.addEventListener("focus", () => {
+      beginPositionHistory();
+      primeMoveSlider(slider);
+    });
     slider.addEventListener("input", () => applyMoveSlider(slider));
     slider.addEventListener("change", () => finishMoveSlider(slider));
     slider.addEventListener("pointerup", () => finishMoveSlider(slider));
@@ -1057,7 +1382,7 @@ async function init() {
       await loadAnnotation();
     } else {
       const data = await getJson("/api/state");
-      renderState(data);
+      renderState(data, { resetHistory: true });
     }
   } catch (error) {
     setStatus(error.message || String(error), true);

@@ -3,6 +3,8 @@ __pycache__/
 
 data/temp/
 data/output/
+data/admin/
+data/export/
 
 .env
 .venv/
