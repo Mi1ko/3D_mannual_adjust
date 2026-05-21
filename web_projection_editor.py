@@ -27,13 +27,28 @@ from projection import camera_to_world, project_world_to_pixels, to_list, world_
 from rendering import VIEW_ORDER, collect_view_cameras, render_all_obj_o_views
 from settings import DEFAULT_SETTINGS, NewLayoutSettings
 
+try:
+    import local_config as _local_config
+except ImportError:
+    _local_config = None
+
 
 DATA_ROOT = APP_ROOT / "data"
 DATA_INPUT_ROOT = DATA_ROOT / "input"
 DATA_OUTPUT_ROOT = DATA_ROOT / "output"
 DATA_TEMP_ROOT = DATA_ROOT / "temp"
 DATA_ADMIN_ROOT = DATA_ROOT / "admin"
+DATA_ADMIN_PENDING_ROOT = DATA_ADMIN_ROOT / "pending"
+DATA_ADMIN_REVIEW_ROOT = DATA_ADMIN_ROOT / "review_results"
 DATA_EXPORT_ROOT = DATA_ROOT / "export"
+
+
+def configured_path(name: str, default: Path) -> Path:
+    value = getattr(_local_config, name, None) if _local_config is not None else None
+    return Path(value).expanduser().resolve() if value else default
+
+
+REFERENCE_DATASET_ROOT = configured_path("REFERENCE_DATASET_ROOT", DATA_ROOT / "reference_3dlpd")
 DEFAULT_DATASET_ROOT = DATA_INPUT_ROOT
 DEFAULT_OUTPUT_ROOT = DATA_OUTPUT_ROOT
 DEFAULT_PORT = 8780
@@ -112,7 +127,7 @@ def numeric_name_key(value: str) -> tuple[int, int | str]:
 def load_json(path: Path) -> dict:
     if not path.is_file():
         raise FileNotFoundError(f"Annotation JSON does not exist: {path}")
-    return json.loads(path.read_text(encoding="utf-8"))
+    return json.loads(path.read_text(encoding="utf-8-sig"))
 
 
 def save_json(path: Path, payload: dict) -> None:
@@ -128,6 +143,12 @@ def safe_stem(value: str) -> str:
     cleaned = re.sub(r"[^0-9A-Za-z_\-]+", "_", str(value).strip())
     cleaned = cleaned.strip("_")
     return cleaned or "label"
+
+
+def safe_filename_stem(value: str | None, default: str = "manual_adjust") -> str:
+    cleaned = re.sub(r'[<>:"/\\|?*\x00-\x1f]+', "_", str(value or "").strip())
+    cleaned = cleaned.strip(" ._")
+    return cleaned or default
 
 
 def ensure_group_id(group: dict, index: int = 0) -> str:
@@ -319,6 +340,351 @@ def needs_admin_review(record: dict | None) -> bool:
     if not record:
         return True
     return str(record.get("status") or "") in {"adjusted", "pending_recheck"}
+
+
+def validation_issue(level: str, title: str, detail: str = "", path: Path | str | None = None) -> dict:
+    return {
+        "level": level,
+        "title": title,
+        "detail": detail,
+        "path": str(path) if path else "",
+    }
+
+
+def is_number_triplet(value: object) -> bool:
+    if not isinstance(value, list) or len(value) != 3:
+        return False
+    return all(isinstance(item, (int, float)) and np.isfinite(float(item)) for item in value)
+
+
+def close_value(left: object, right: object, tolerance: float = 1e-6) -> bool:
+    if isinstance(left, (int, float)) and isinstance(right, (int, float)):
+        return abs(float(left) - float(right)) <= tolerance
+    if isinstance(left, list) and isinstance(right, list) and len(left) == len(right):
+        return all(close_value(a, b, tolerance) for a, b in zip(left, right))
+    if isinstance(left, dict) and isinstance(right, dict) and set(left) == set(right):
+        return all(close_value(left[key], right[key], tolerance) for key in left)
+    return left == right
+
+
+def obj_vertex_bounds(path: Path) -> dict:
+    mins = [float("inf"), float("inf"), float("inf")]
+    maxs = [float("-inf"), float("-inf"), float("-inf")]
+    count = 0
+    with path.open("r", encoding="utf-8", errors="ignore") as handle:
+        for line in handle:
+            if not line.startswith("v "):
+                continue
+            parts = line.split()
+            if len(parts) < 4:
+                continue
+            try:
+                values = [float(parts[1]), float(parts[2]), float(parts[3])]
+            except ValueError:
+                continue
+            count += 1
+            for index, value in enumerate(values):
+                mins[index] = min(mins[index], value)
+                maxs[index] = max(maxs[index], value)
+    return {"count": count, "min": mins, "max": maxs}
+
+
+def point_file_bounds(path: Path) -> dict:
+    mins = [float("inf"), float("inf"), float("inf")]
+    maxs = [float("-inf"), float("-inf"), float("-inf")]
+    count = 0
+    with path.open("r", encoding="utf-8", errors="ignore") as handle:
+        for line in handle:
+            parts = line.split()
+            if len(parts) < 3:
+                continue
+            try:
+                values = [float(parts[0]), float(parts[1]), float(parts[2])]
+            except ValueError:
+                continue
+            count += 1
+            for index, value in enumerate(values):
+                mins[index] = min(mins[index], value)
+                maxs[index] = max(maxs[index], value)
+    return {"count": count, "min": mins, "max": maxs}
+
+
+def bbox_size(bounds: dict) -> list[float]:
+    return [float(bounds["max"][index]) - float(bounds["min"][index]) for index in range(3)]
+
+
+def bbox_diag(bounds: dict) -> float:
+    size = bbox_size(bounds)
+    return float(sum(value * value for value in size) ** 0.5)
+
+
+def bbox_close(left: dict, right: dict, tolerance_ratio: float = 0.03) -> bool:
+    scale = max(bbox_diag(left), bbox_diag(right), 1e-6)
+    diffs = [
+        abs(float(left["min"][index]) - float(right["min"][index]))
+        for index in range(3)
+    ] + [
+        abs(float(left["max"][index]) - float(right["max"][index]))
+        for index in range(3)
+    ]
+    return max(diffs, default=0.0) <= scale * tolerance_ratio
+
+
+def point_in_bbox(point: list, bounds: dict, margin: float = 0.0) -> bool:
+    return all(
+        float(bounds["min"][index]) - margin <= float(point[index]) <= float(bounds["max"][index]) + margin
+        for index in range(3)
+    )
+
+
+def choose_points_file(points_dir: Path) -> Path | None:
+    preferred = [
+        "pts-10000.txt",
+        "sample-points-all-pts-nor-rgba-10000.txt",
+        "pts-10000.pts",
+        "sample-points-all-pts-label-10000.ply",
+    ]
+    for name in preferred:
+        candidate = points_dir / name
+        if candidate.is_file() and candidate.suffix.lower() != ".ply":
+            return candidate
+    return next((path for path in sorted(points_dir.glob("*.txt")) if path.is_file()), None)
+
+
+def validation_summary(issues: list[dict]) -> dict:
+    errors = sum(1 for issue in issues if issue.get("level") == "error")
+    warnings = sum(1 for issue in issues if issue.get("level") == "warning")
+    infos = sum(1 for issue in issues if issue.get("level") == "info")
+    if errors:
+        label = f"{errors} 个错误，{warnings} 个警告"
+        status = "error"
+    elif warnings:
+        label = f"{warnings} 个警告"
+        status = "warning"
+    else:
+        label = "通过"
+        status = "ok"
+    return {"status": status, "label": label, "errors": errors, "warnings": warnings, "infos": infos}
+
+
+def validate_admin_layout_json(layout_json: dict, reference_json: dict | None, category: str, sample_name: str, issues: list[dict]) -> None:
+    required_top = {"version", "name", "layout_level", "layout_type", "sample_id", "category", "hierarchy_file", "normalization", "groups"}
+    allowed_top = set(required_top)
+    missing = sorted(required_top - set(layout_json))
+    extra = sorted(set(layout_json) - allowed_top)
+    if missing:
+        issues.append(validation_issue("error", "Layout JSON 缺少必要字段", ", ".join(missing)))
+    if extra:
+        issues.append(validation_issue("warning", "Layout JSON 有额外字段", ", ".join(extra)))
+    expected_values = {
+        "version": "after_mannual_adjust",
+        "layout_level": OUTPUT_LAYOUT_LEVEL,
+        "layout_type": "manual_adjusted",
+        "sample_id": sample_name,
+        "category": category,
+    }
+    for key, expected in expected_values.items():
+        if layout_json.get(key) != expected:
+            issues.append(validation_issue("error", f"Layout JSON 字段不匹配：{key}", f"当前为 {layout_json.get(key)!r}，应为 {expected!r}"))
+    groups = layout_json.get("groups")
+    if not isinstance(groups, list) or not groups:
+        issues.append(validation_issue("error", "Layout JSON groups 无效", "groups 必须是非空数组"))
+        return
+
+    allowed_group = {"group_id", "id", "ori_id", "source_objs", "target_g", "anchor", "label", "leader_line"}
+    allowed_label = {"text", "box_size", "center"}
+    allowed_anchor = {"point"}
+    allowed_leader = {"start", "bend_points", "end"}
+    seen_group_ids: set[str] = set()
+    obj_bounds: dict | None = None
+    for index, group in enumerate(groups):
+        if not isinstance(group, dict):
+            issues.append(validation_issue("error", "Layout JSON group 无效", f"第 {index + 1} 个 group 不是对象"))
+            continue
+        group_id = str(group.get("group_id") or "")
+        if not group_id:
+            issues.append(validation_issue("error", "Layout JSON group 缺少 group_id", f"第 {index + 1} 个 group"))
+        elif group_id in seen_group_ids:
+            issues.append(validation_issue("error", "Layout JSON group_id 重复", group_id))
+        seen_group_ids.add(group_id)
+        extra_group = sorted(set(group) - allowed_group)
+        if extra_group:
+            issues.append(validation_issue("warning", f"group {group_id or index + 1} 有额外字段", ", ".join(extra_group)))
+        label = group.get("label") or {}
+        anchor = group.get("anchor") or {}
+        leader = group.get("leader_line") or {}
+        if not isinstance(label, dict) or not isinstance(anchor, dict) or not isinstance(leader, dict):
+            issues.append(validation_issue("error", f"group {group_id or index + 1} 结构错误", "label、anchor、leader_line 必须是对象"))
+            continue
+        for field, allowed, title in ((label, allowed_label, "label"), (anchor, allowed_anchor, "anchor"), (leader, allowed_leader, "leader_line")):
+            extra_field = sorted(set(field) - allowed)
+            if extra_field:
+                issues.append(validation_issue("warning", f"group {group_id or index + 1} 的 {title} 有额外字段", ", ".join(extra_field)))
+        if not is_number_triplet(label.get("center")):
+            issues.append(validation_issue("error", f"group {group_id or index + 1} label.center 无效"))
+        if not is_number_triplet(label.get("box_size")):
+            issues.append(validation_issue("error", f"group {group_id or index + 1} label.box_size 无效"))
+        if not is_number_triplet(anchor.get("point")):
+            issues.append(validation_issue("error", f"group {group_id or index + 1} anchor.point 无效"))
+        if is_number_triplet(anchor.get("point")) and is_number_triplet(leader.get("start")) and not close_value(anchor.get("point"), leader.get("start"), 1e-5):
+            issues.append(validation_issue("warning", f"group {group_id or index + 1} leader_line.start 与 anchor.point 不一致"))
+        if is_number_triplet(label.get("center")) and is_number_triplet(leader.get("end")) and not close_value(label.get("center"), leader.get("end"), 1e-5):
+            issues.append(validation_issue("warning", f"group {group_id or index + 1} leader_line.end 与 label.center 不一致"))
+
+    if reference_json:
+        reference_groups = reference_json.get("groups") if isinstance(reference_json.get("groups"), list) else []
+        reference_by_id = {str(group.get("group_id") or ""): group for group in reference_groups if isinstance(group, dict)}
+        current_ids = {str(group.get("group_id") or "") for group in groups if isinstance(group, dict)}
+        reference_ids = set(reference_by_id)
+        if current_ids != reference_ids:
+            missing_ids = sorted(reference_ids - current_ids)
+            extra_ids = sorted(current_ids - reference_ids)
+            detail = []
+            if missing_ids:
+                detail.append(f"缺少 {missing_ids}")
+            if extra_ids:
+                detail.append(f"多出 {extra_ids}")
+            issues.append(validation_issue("error", "Layout groups 与 3DLPD layout2 不一致", "；".join(detail)))
+        if len(groups) != len(reference_groups):
+            issues.append(validation_issue("error", "Layout group 数量与 3DLPD layout2 不一致", f"当前 {len(groups)}，参考 {len(reference_groups)}"))
+        for group in groups:
+            if not isinstance(group, dict):
+                continue
+            group_id = str(group.get("group_id") or "")
+            reference_group = reference_by_id.get(group_id)
+            if not reference_group:
+                continue
+            checks = [
+                ("id", group.get("id"), reference_group.get("id")),
+                ("ori_id", group.get("ori_id"), reference_group.get("ori_id")),
+                ("source_objs", group.get("source_objs"), reference_group.get("source_objs")),
+                ("target_g", group.get("target_g"), reference_group.get("target_g")),
+                ("label.text", (group.get("label") or {}).get("text"), (reference_group.get("label") or {}).get("text")),
+                ("label.box_size", (group.get("label") or {}).get("box_size"), (reference_group.get("label") or {}).get("box_size")),
+            ]
+            for label, current, expected in checks:
+                if not close_value(current, expected, 1e-5):
+                    issues.append(validation_issue("error", f"group {group_id} 的 {label} 与 3DLPD layout2 不一致"))
+        if not close_value(layout_json.get("normalization"), reference_json.get("normalization"), 1e-8):
+            issues.append(validation_issue("error", "Layout normalization 与 3DLPD layout2 不一致"))
+        if layout_json.get("hierarchy_file") != reference_json.get("hierarchy_file"):
+            issues.append(validation_issue("warning", "Layout hierarchy_file 与 3DLPD layout2 不一致", f"当前 {layout_json.get('hierarchy_file')!r}，参考 {reference_json.get('hierarchy_file')!r}"))
+
+
+def validate_admin_sample(submission_root: Path, key: str, sample: dict, layout_path: Path, obj_o_info: dict) -> dict:
+    issues: list[dict] = []
+    category = str(sample.get("category") or "")
+    sample_name = str(sample.get("sample_id") or "")
+    expected_key = sample_key(category, sample_name)
+    if key != expected_key or sample.get("key") not in {None, "", expected_key}:
+        issues.append(validation_issue("error", "记录 key 与 category/sample_id 不匹配", f"记录 key={key!r}，期望 {expected_key!r}"))
+    expected_relative = Path("Layout") / category / sample_name / OUTPUT_LAYOUT_LEVEL
+    expected_layout = (submission_root / expected_relative).resolve()
+    if layout_path != expected_layout:
+        issues.append(validation_issue("error", "记录 output_layout_dir 与文件夹不匹配", f"当前 {layout_path}，期望 {expected_layout}"))
+    if not layout_path.is_dir():
+        issues.append(validation_issue("error", "样本 layout1 文件夹不存在", path=layout_path))
+        return {"issues": issues, "summary": validation_summary(issues)}
+
+    annotation_path = layout_path / "Annotation" / f"{sample_name}.json"
+    if not annotation_path.is_file():
+        issues.append(validation_issue("error", "Layout Annotation JSON 不存在", path=annotation_path))
+        return {"issues": issues, "summary": validation_summary(issues)}
+
+    layout_json = None
+    try:
+        layout_json = load_json(annotation_path)
+    except Exception as exc:
+        issues.append(validation_issue("error", "Layout Annotation JSON 无法解析", str(exc), annotation_path))
+
+    reference_root = REFERENCE_DATASET_ROOT
+    reference_json_path = reference_root / "Layout" / category / sample_name / INPUT_LAYOUT_LEVEL / "Annotation" / f"{sample_name}.json"
+    reference_json = None
+    if not reference_root.is_dir():
+        issues.append(validation_issue("error", "3DLPD 参考目录不存在", path=reference_root))
+    elif not reference_json_path.is_file():
+        issues.append(validation_issue("error", "3DLPD 对应 Layout JSON 不存在", path=reference_json_path))
+    else:
+        try:
+            reference_json = load_json(reference_json_path)
+        except Exception as exc:
+            issues.append(validation_issue("error", "3DLPD Layout JSON 无法解析", str(exc), reference_json_path))
+
+    if layout_json:
+        validate_admin_layout_json(layout_json, reference_json, category, sample_name, issues)
+
+    mutiviews_dir = layout_path / "Mutiviews"
+    for view in (*VIEW_ORDER, "combined"):
+        image_path = mutiviews_dir / projection_filename(sample_name, view)
+        if not image_path.is_file():
+            issues.append(validation_issue("error", f"缺少 {view} 投影图", path=image_path))
+
+    obj_o_dir = layout_path / "Obj-O"
+    mtl_path = obj_o_dir / f"{sample_name}-O.mtl"
+    if not mtl_path.is_file():
+        issues.append(validation_issue("error", "Obj-O MTL 文件不存在", path=mtl_path))
+    missing_views = [view for view in VIEW_ORDER if not (obj_o_dir / f"{sample_name}-{view}-O.obj").is_file()]
+    if missing_views:
+        issues.append(validation_issue("error", "Obj-O 缺少视角文件", ", ".join(missing_views), obj_o_dir))
+    if obj_o_info.get("mode") != "adaptive":
+        issues.append(validation_issue("error", "Obj-O 不是五视角 adaptive 输出", f"当前模式：{obj_o_info.get('mode')}"))
+
+    reference_obj_p = reference_root / "Obj-P" / category / sample_name / f"{sample_name}-P.obj"
+    reference_points_dir = reference_root / "Points" / category / sample_name
+    reference_obj_bounds = None
+    if reference_obj_p.is_file():
+        try:
+            reference_obj_bounds = obj_vertex_bounds(reference_obj_p)
+            if reference_obj_bounds["count"] <= 0:
+                issues.append(validation_issue("error", "3DLPD Obj-P 没有顶点", path=reference_obj_p))
+        except Exception as exc:
+            issues.append(validation_issue("error", "3DLPD Obj-P 无法读取", str(exc), reference_obj_p))
+    else:
+        issues.append(validation_issue("error", "3DLPD 对应 Obj-P 不存在", path=reference_obj_p))
+
+    points_file = choose_points_file(reference_points_dir) if reference_points_dir.is_dir() else None
+    if not reference_points_dir.is_dir():
+        issues.append(validation_issue("error", "3DLPD 对应 Points 目录不存在", path=reference_points_dir))
+    elif points_file is None:
+        issues.append(validation_issue("error", "3DLPD Points 中没有可解析点云文件", path=reference_points_dir))
+    elif reference_obj_bounds is not None:
+        try:
+            points_bounds = point_file_bounds(points_file)
+            if points_bounds["count"] <= 0:
+                issues.append(validation_issue("error", "3DLPD 点云文件没有可解析点", path=points_file))
+            elif not bbox_close(reference_obj_bounds, points_bounds, 0.03):
+                issues.append(validation_issue("error", "3DLPD Obj-P 与点云坐标范围不一致", f"点云文件：{points_file.name}"))
+        except Exception as exc:
+            issues.append(validation_issue("error", "3DLPD 点云文件无法读取", str(exc), points_file))
+
+    if reference_obj_bounds is not None and layout_json:
+        margin = max(bbox_diag(reference_obj_bounds) * 0.08, 1e-4)
+        for group in layout_json.get("groups") or []:
+            if not isinstance(group, dict):
+                continue
+            point = (group.get("anchor") or {}).get("point")
+            group_id = str(group.get("group_id") or "")
+            if is_number_triplet(point) and not point_in_bbox(point, reference_obj_bounds, margin):
+                issues.append(validation_issue("warning", f"group {group_id} anchor.point 超出 Obj-P 坐标范围", "请确认是否仍然落在物体上"))
+
+    main_obj_o = obj_o_dir / f"{sample_name}-main-O.obj"
+    if main_obj_o.is_file() and reference_obj_bounds is not None:
+        try:
+            obj_o_bounds = obj_vertex_bounds(main_obj_o)
+            if obj_o_bounds["count"] <= 0:
+                issues.append(validation_issue("error", "提交的 main Obj-O 没有顶点", path=main_obj_o))
+            else:
+                margin = max(bbox_diag(reference_obj_bounds) * 0.02, 1e-4)
+                for index in range(3):
+                    if obj_o_bounds["min"][index] > reference_obj_bounds["min"][index] + margin or obj_o_bounds["max"][index] < reference_obj_bounds["max"][index] - margin:
+                        issues.append(validation_issue("warning", "提交的 Obj-O 未覆盖参考 Obj-P 坐标范围", "可能不是同一个样本或坐标系异常", main_obj_o))
+                        break
+        except Exception as exc:
+            issues.append(validation_issue("error", "提交的 main Obj-O 无法读取", str(exc), main_obj_o))
+
+    if not any(issue["level"] in {"error", "warning"} for issue in issues):
+        issues.append(validation_issue("info", "记录、Layout、Obj-O、Obj-P 和点云一致性检查通过"))
+    return {"issues": issues, "summary": validation_summary(issues), "reference_root": str(reference_root)}
 
 
 def preview_label_name(index: int) -> str:
@@ -1911,8 +2277,7 @@ def export_filename(name: str | None = None) -> str:
             annotation = STATE.get("annotation")
             if annotation is not None:
                 raw_name = current_editor_name(annotation)
-    cleaned = re.sub(r'[<>:"/\\|?*\x00-\x1f]+', "_", raw_name or "manual_adjust").strip(" ._")
-    cleaned = cleaned or "manual_adjust"
+    cleaned = safe_filename_stem(raw_name, "manual_adjust")
     return f"{cleaned}_{datetime.now().strftime('%Y%m%d')}.zip"
 
 
@@ -2017,7 +2382,7 @@ def build_output_export_zip(output_root: Path | str, name: str | None = None) ->
 
 def unique_export_path(filename: str) -> Path:
     DATA_EXPORT_ROOT.mkdir(parents=True, exist_ok=True)
-    safe_name = safe_stem(Path(filename).stem) + Path(filename).suffix
+    safe_name = safe_filename_stem(Path(filename).stem, "manual_adjust") + Path(filename).suffix
     candidate = DATA_EXPORT_ROOT / safe_name
     if not candidate.exists():
         return candidate
@@ -2125,26 +2490,88 @@ def merge_review_records(output_root: Path | str, imported_records: dict) -> dic
     return {"merged": merged, "skipped": skipped, "records_path": str(records_path(output_root))}
 
 
+def ensure_admin_roots() -> None:
+    DATA_ADMIN_PENDING_ROOT.mkdir(parents=True, exist_ok=True)
+    DATA_ADMIN_REVIEW_ROOT.mkdir(parents=True, exist_ok=True)
+
+
+def admin_review_root_for_submission(submission_root: Path) -> Path:
+    ensure_admin_roots()
+    root = (DATA_ADMIN_REVIEW_ROOT / submission_root.name).resolve()
+    if not path_is_within(root, DATA_ADMIN_REVIEW_ROOT.resolve()):
+        raise ValueError("Invalid admin review output.")
+    return root
+
+
+def admin_review_applies_to_source(source_sample: dict, review_sample: dict) -> bool:
+    if not isinstance(review_sample, dict):
+        return False
+    if str(review_sample.get("status") or "") not in {"reviewed", "changes_required"}:
+        return False
+    source_cycle = int(source_sample.get("review_cycle") or 0)
+    review_cycle = int(review_sample.get("review_cycle") or 0)
+    if review_cycle < source_cycle:
+        return False
+    reviewed_at = parse_iso((review_sample.get("review") or {}).get("reviewed_at"))
+    adjusted_at = parse_iso(source_sample.get("adjusted_at") or (source_sample.get("adjuster") or {}).get("updated_at"))
+    if (
+        str(source_sample.get("status") or "") in {"adjusted", "pending_recheck"}
+        and reviewed_at is not None
+        and adjusted_at is not None
+        and adjusted_at > reviewed_at
+    ):
+        return False
+    return True
+
+
+def merge_admin_review_records(source_records: dict, review_records: dict) -> dict:
+    merged = deepcopy(source_records)
+    source_samples = source_records.get("samples") if isinstance(source_records.get("samples"), dict) else {}
+    review_samples = review_records.get("samples") if isinstance(review_records.get("samples"), dict) else {}
+    samples: dict[str, dict] = {}
+    for key, source_sample in source_samples.items():
+        if not isinstance(source_sample, dict):
+            continue
+        sample = deepcopy(source_sample)
+        review_sample = review_samples.get(key)
+        if isinstance(review_sample, dict) and admin_review_applies_to_source(source_sample, review_sample):
+            for field in ("status", "review_cycle", "review", "history"):
+                if field in review_sample:
+                    sample[field] = deepcopy(review_sample[field])
+        samples[key] = sample
+    merged["samples"] = samples
+    return merged
+
+
+def load_admin_effective_records(submission_root: Path) -> dict:
+    source_records = load_records(submission_root)
+    review_root = admin_review_root_for_submission(submission_root)
+    review_records = load_records(review_root)
+    return merge_admin_review_records(source_records, review_records)
+
+
 def admin_submission_root(name: str | None) -> Path:
+    ensure_admin_roots()
     raw_name = str(name or "").strip()
     if raw_name in {"", "."}:
-        root = DATA_ADMIN_ROOT.resolve()
+        root = DATA_ADMIN_PENDING_ROOT.resolve()
     else:
-        root = (DATA_ADMIN_ROOT / raw_name).resolve()
-    if not path_is_within(root, DATA_ADMIN_ROOT.resolve()):
+        root = (DATA_ADMIN_PENDING_ROOT / raw_name).resolve()
+    if not path_is_within(root, DATA_ADMIN_PENDING_ROOT.resolve()):
         raise ValueError("Invalid admin submission.")
     return root
 
 
 def list_admin_submissions() -> dict:
-    DATA_ADMIN_ROOT.mkdir(parents=True, exist_ok=True)
-    roots: list[Path] = []
-    if records_path(DATA_ADMIN_ROOT).is_file():
-        roots.append(DATA_ADMIN_ROOT.resolve())
-    roots.extend(path.resolve() for path in DATA_ADMIN_ROOT.iterdir() if path.is_dir() and records_path(path).is_file())
+    ensure_admin_roots()
+    roots = [
+        path.resolve()
+        for path in DATA_ADMIN_PENDING_ROOT.iterdir()
+        if path.is_dir() and records_path(path).is_file()
+    ]
     submissions = []
     for root in roots:
-        records = load_records(root)
+        records = load_admin_effective_records(root)
         samples = records.get("samples") or {}
         adjusters = sorted(
             {
@@ -2154,31 +2581,39 @@ def list_admin_submissions() -> dict:
             }
         )
         reviewed_count = sum(1 for sample in samples.values() if isinstance(sample, dict) and reviewed_for_current_cycle(sample))
-        submission_name = "." if root == DATA_ADMIN_ROOT.resolve() else root.name
+        pending_count = sum(1 for sample in samples.values() if isinstance(sample, dict) and needs_admin_review(sample))
+        review_root = admin_review_root_for_submission(root)
         submissions.append(
             {
-                "name": submission_name,
-                "display_name": root.name if submission_name != "." else "data/admin",
+                "name": root.name,
+                "display_name": root.name,
                 "path": str(root),
+                "pending_path": str(root),
+                "review_path": str(review_root),
+                "review_records_path": str(records_path(review_root)),
                 "adjusters": adjusters,
                 "total": len(samples),
                 "reviewed_count": reviewed_count,
-                "pending_count": len(samples) - reviewed_count,
+                "pending_count": pending_count,
             }
         )
     submissions.sort(key=lambda item: item["display_name"].lower())
-    return {"root": str(DATA_ADMIN_ROOT), "submissions": submissions}
+    return {
+        "root": str(DATA_ADMIN_ROOT),
+        "pending_root": str(DATA_ADMIN_PENDING_ROOT),
+        "review_root": str(DATA_ADMIN_REVIEW_ROOT),
+        "submissions": submissions,
+    }
 
 
-def record_sort_key(item: tuple[str, dict]) -> tuple[int, int, str, tuple[int, int | str]]:
+def record_sort_key(item: tuple[str, dict]) -> tuple[int, str, tuple[int, int | str]]:
     key, sample = item
-    status_rank = 0 if needs_admin_review(sample) else 1
     rating_rank = {"bad": 0, "medium": 1, "good": 2}.get(str(sample.get("adjuster", {}).get("rating") or ""), 3)
-    return (status_rank, rating_rank, str(sample.get("category") or ""), numeric_name_key(str(sample.get("sample_id") or key)))
+    return (rating_rank, str(sample.get("category") or ""), numeric_name_key(str(sample.get("sample_id") or key)))
 
 
 def admin_sample_summaries(submission_root: Path) -> list[dict]:
-    records = load_records(submission_root)
+    records = load_admin_effective_records(submission_root)
     samples = records.get("samples") or {}
     summaries = []
     for key, sample in sorted(samples.items(), key=record_sort_key):
@@ -2202,7 +2637,7 @@ def admin_sample_summaries(submission_root: Path) -> list[dict]:
 
 
 def admin_sample_payload(submission_root: Path, index: int = 0, sample_key_value: str | None = None) -> dict:
-    records = load_records(submission_root)
+    records = load_admin_effective_records(submission_root)
     samples = records.get("samples") or {}
     summaries = admin_sample_summaries(submission_root)
     if not summaries:
@@ -2233,6 +2668,16 @@ def admin_sample_payload(submission_root: Path, index: int = 0, sample_key_value
         if (mutiviews_dir / projection_filename(sample_name, view)).is_file()
     }
     obj_o_info = obj_o_info_from_dir(obj_o_dir, sample_name)
+    validation = validate_admin_sample(submission_root, summary["key"], sample, layout_path, obj_o_info)
+    preview_camera = {}
+    preview_view_cameras = {}
+    try:
+        preview_annotation = load_json(layout_path / "Annotation" / f"{sample_name}.json")
+        apply_internal_camera(preview_annotation)
+        preview_camera = camera_payload(preview_annotation)
+        preview_view_cameras = projection_camera_payload(preview_annotation)
+    except Exception:
+        pass
     current = {
         **summary,
         "layout_path": str(layout_path),
@@ -2240,16 +2685,22 @@ def admin_sample_payload(submission_root: Path, index: int = 0, sample_key_value
         "obj_o_dir": str(obj_o_dir),
         "projection_images": images,
         "obj_o_sources": {"output": obj_o_info},
+        "camera": preview_camera,
+        "view_cameras": preview_view_cameras,
         "adjuster": sample.get("adjuster") or {},
         "review": sample.get("review") or {},
         "review_cycle": int(sample.get("review_cycle") or 0),
         "history": sample.get("history") or [],
+        "validation": validation,
     }
     return {
         "submission": {
-            "name": "." if submission_root == DATA_ADMIN_ROOT.resolve() else submission_root.name,
+            "name": submission_root.name,
             "path": str(submission_root),
             "records_path": str(records_path(submission_root)),
+            "pending_path": str(submission_root),
+            "review_path": str(admin_review_root_for_submission(submission_root)),
+            "review_records_path": str(records_path(admin_review_root_for_submission(submission_root))),
         },
         "samples": summaries,
         "current": current,
@@ -2262,13 +2713,14 @@ def admin_sample_payload(submission_root: Path, index: int = 0, sample_key_value
 
 def save_admin_review(submission_name: str, payload: dict) -> dict:
     submission_root = admin_submission_root(submission_name)
+    review_root = admin_review_root_for_submission(submission_root)
     key = str(payload.get("sample_key") or "").strip()
     if not key:
         raise ValueError("Missing sample key.")
     rating = normalize_rating(payload.get("admin_rating"), "admin_rating")
     remark = str(payload.get("admin_remark") or "").strip()
     reviewer_name = str(payload.get("reviewer_name") or "").strip()
-    records = load_records(submission_root)
+    records = load_admin_effective_records(submission_root)
     sample = records.get("samples", {}).get(key)
     if not isinstance(sample, dict):
         raise KeyError(f"Sample not found in records: {key}")
@@ -2303,17 +2755,19 @@ def save_admin_review(submission_name: str, payload: dict) -> dict:
         }
     )
     sample["history"] = history
-    records["samples"][key] = sample
-    save_records(submission_root, records)
+    review_records = load_records(review_root)
+    review_records.setdefault("samples", {})[key] = sample
+    save_records(review_root, review_records)
     return admin_sample_payload(submission_root, sample_key_value=key)
 
 
 def admin_records_download(submission_name: str) -> tuple[bytes, str]:
     submission_root = admin_submission_root(submission_name)
-    path = records_path(submission_root)
+    review_root = admin_review_root_for_submission(submission_root)
+    path = records_path(review_root)
     if not path.is_file():
-        raise FileNotFoundError(f"Records file does not exist: {path}")
-    filename = f"{safe_stem(submission_root.name or 'admin')}_review_records_{datetime.now().strftime('%Y%m%d')}.json"
+        save_records(review_root, load_records(review_root))
+    filename = f"{safe_filename_stem(submission_root.name, 'admin')}_review_records_{datetime.now().strftime('%Y%m%d')}.json"
     return path.read_bytes(), filename
 
 
@@ -2359,6 +2813,8 @@ class EditorHandler(SimpleHTTPRequestHandler):
                     "output_root": str(DEFAULT_OUTPUT_ROOT),
                     "temp_root": str(DATA_TEMP_ROOT),
                     "admin_root": str(DATA_ADMIN_ROOT),
+                    "admin_pending_root": str(DATA_ADMIN_PENDING_ROOT),
+                    "admin_review_root": str(DATA_ADMIN_REVIEW_ROOT),
                     "records_filename": RECORDS_FILENAME,
                 },
             )

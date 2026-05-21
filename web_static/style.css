@@ -855,7 +855,7 @@ body.admin-page {
 
 .admin-info-panel {
   display: grid;
-  grid-template-rows: auto auto auto auto auto auto minmax(0, 1fr);
+  grid-template-rows: auto auto auto auto auto auto auto auto minmax(0, 1fr);
   gap: 8px;
   padding: 10px;
   overflow: hidden;
@@ -865,6 +865,23 @@ body.admin-page {
   margin-top: 3px;
   font-size: 19px;
   overflow-wrap: anywhere;
+}
+
+.admin-sample-jump {
+  display: block;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.admin-sample-jump select {
+  width: 100%;
+  min-height: 34px;
+  margin-top: 4px;
+  padding: 6px 8px;
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 800;
 }
 
 .admin-sample-title span,
@@ -901,6 +918,90 @@ body.admin-page {
   margin: 2px 0 0;
   font-weight: 900;
   overflow-wrap: anywhere;
+}
+
+.admin-validation-panel {
+  min-height: 0;
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  gap: 5px;
+  padding: 7px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface-alt);
+}
+
+.admin-validation-panel header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  min-height: 0;
+}
+
+.admin-validation-panel header strong {
+  color: #263a35;
+  font-size: 12px;
+}
+
+.admin-validation-panel header span {
+  font-size: 12px;
+  font-weight: 900;
+}
+
+.admin-validation-panel header span.ok {
+  color: var(--accent-dark);
+}
+
+.admin-validation-panel header span.warning {
+  color: #9a5b06;
+}
+
+.admin-validation-panel header span.error {
+  color: var(--warn);
+}
+
+#validationList {
+  min-height: 0;
+  max-height: 112px;
+  overflow: auto;
+  display: grid;
+  align-content: start;
+  gap: 4px;
+}
+
+.validation-item {
+  display: grid;
+  gap: 1px;
+  padding: 5px 6px;
+  border-radius: 6px;
+  border: 1px solid var(--line);
+  background: #fff;
+  font-size: 12px;
+}
+
+.validation-item strong {
+  color: #2a3835;
+}
+
+.validation-item span {
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+
+.validation-item.error {
+  border-color: #d7a18d;
+  background: var(--warn-soft);
+}
+
+.validation-item.warning {
+  border-color: #dfc36f;
+  background: #fff9e7;
+}
+
+.validation-item.info {
+  border-color: #b7d5cc;
+  background: var(--accent-soft);
 }
 
 .admin-readonly-field {

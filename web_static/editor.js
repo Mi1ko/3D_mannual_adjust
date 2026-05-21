@@ -1131,7 +1131,7 @@ function updateSaveButtons(data) {
   }
   if (exportButton) {
     exportButton.disabled = !hasName;
-    exportButton.title = hasName ? "下载 output 和 preview 预览图 ZIP" : "请先输入名字";
+    exportButton.title = hasName ? "导出 data/output 为本地 ZIP，不包含 preview 文件夹" : "请先输入名字";
   }
   updateLoadButtons();
   updateHistoryButtons();

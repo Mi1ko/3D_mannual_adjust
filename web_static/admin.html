@@ -34,11 +34,21 @@
           <span id="sampleCounter">-</span>
           <h2 id="adminSampleTitle">未加载</h2>
         </div>
+        <label class="admin-sample-jump">样本直达
+          <select id="adminSampleSelect"></select>
+        </label>
         <dl class="admin-meta-list">
           <div><dt>微调者</dt><dd id="adjusterName">-</dd></div>
           <div><dt>自评</dt><dd id="selfRatingText">-</dd></div>
           <div><dt>状态</dt><dd id="reviewStatusText">-</dd></div>
         </dl>
+        <section class="admin-validation-panel" aria-labelledby="validationTitle">
+          <header>
+            <strong id="validationTitle">自动校验</strong>
+            <span id="validationSummary">-</span>
+          </header>
+          <div id="validationList"></div>
+        </section>
         <section class="admin-readonly-field" aria-labelledby="selfRemarkLabel">
           <span id="selfRemarkLabel">微调备注</span>
           <p id="selfRemarkText">-</p>

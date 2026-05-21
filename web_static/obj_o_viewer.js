@@ -6,7 +6,7 @@ import { OBJLoader } from "three/addons/loaders/OBJLoader.js";
 const canvas = document.getElementById("objOCanvas");
 const empty = document.getElementById("objOEmpty");
 const isAdminViewer = document.body?.classList.contains("admin-page");
-const initialZoom = isAdminViewer ? 1.45 : 1.15;
+const initialZoom = isAdminViewer ? 0.9 : 1.15;
 
 let renderer = null;
 let scene = null;

@@ -58,32 +58,35 @@ function selectedSubmission() {
   return $("submissionSelect")?.value || adminState.submission || ".";
 }
 
-function populateSubmissions(data) {
+function populateSubmissions(data, preferredSubmission = adminState.submission) {
   adminState.submissions = data.submissions || [];
   const select = $("submissionSelect");
   select.innerHTML = "";
   for (const submission of adminState.submissions) {
     const option = document.createElement("option");
     option.value = submission.name;
-    const adjuster = submission.adjusters?.length ? ` | ${submission.adjusters.join(", ")}` : "";
-    option.textContent = `${submission.display_name}${adjuster} | ${submission.reviewed_count}/${submission.total}`;
+    const adjuster = submission.adjusters?.length ? submission.adjusters.join(", ") : "";
+    option.textContent = `${submission.display_name} | 已审 ${submission.reviewed_count}/${submission.total}`;
+    if (adjuster) option.title = `微调者：${adjuster}`;
     select.appendChild(option);
   }
   if (adminState.submissions.length) {
-    adminState.submission = adminState.submissions[0].name;
+    const names = adminState.submissions.map((submission) => submission.name);
+    adminState.submission = names.includes(preferredSubmission) ? preferredSubmission : adminState.submissions[0].name;
     select.value = adminState.submission;
   }
 }
 
-async function loadSubmissions() {
+async function loadSubmissions(options = {}) {
+  const { autoload = true, preferredSubmission = adminState.submission } = options;
   const data = await getJson("/api/admin/submissions");
-  populateSubmissions(data);
+  populateSubmissions(data, preferredSubmission);
   if (!adminState.submissions.length) {
-    setStatus("data/admin 下没有找到带 manual_adjust_records.json 的解压目录", true);
+    setStatus("data/admin/pending 下没有找到带 manual_adjust_records.json 的提交包", true);
     renderEmpty();
     return;
   }
-  await loadSample(0);
+  if (autoload) await loadSample(0);
 }
 
 async function loadSample(index = adminState.index, key = "") {
@@ -100,10 +103,12 @@ function renderEmpty() {
   $("progressText").textContent = "-";
   $("sampleCounter").textContent = "-";
   $("adminSampleTitle").textContent = "未加载";
+  renderSampleJump(null);
   $("adjusterName").textContent = "-";
   $("selfRatingText").textContent = "-";
   $("reviewStatusText").textContent = "-";
   $("selfRemarkText").textContent = "-";
+  renderValidation(null);
   $("adminRating").value = "";
   $("adminRemark").value = "";
   for (const id of Object.values(imageIds)) $(id)?.removeAttribute("src");
@@ -117,6 +122,60 @@ function renderImages(sample) {
     if (!img) continue;
     if (images[view]) img.src = fileUrl(images[view]);
     else img.removeAttribute("src");
+  }
+}
+
+function renderSampleJump(data, currentKey = "") {
+  const select = $("adminSampleSelect");
+  if (!select) return;
+  const samples = Array.isArray(data?.samples) ? data.samples : [];
+  select.innerHTML = "";
+  select.disabled = !samples.length;
+  for (const [index, sample] of samples.entries()) {
+    const option = document.createElement("option");
+    option.value = sample.key;
+    const status = sample.status_label || (sample.reviewed ? "已审核" : "待审核");
+    option.textContent = `${index + 1}. ${sample.category}/${sample.sample_id} · ${status}`;
+    select.appendChild(option);
+  }
+  if (currentKey) select.value = currentKey;
+}
+
+function renderValidation(sample) {
+  const summaryNode = $("validationSummary");
+  const listNode = $("validationList");
+  if (!summaryNode || !listNode) return;
+  const validation = sample?.validation || {};
+  const summary = validation.summary || {};
+  const issues = Array.isArray(validation.issues) ? validation.issues : [];
+  summaryNode.textContent = summary.label || "-";
+  summaryNode.className = summary.status || "";
+  listNode.innerHTML = "";
+  if (!issues.length) {
+    const empty = document.createElement("div");
+    empty.className = "validation-item info";
+    empty.textContent = "暂无校验结果";
+    listNode.appendChild(empty);
+    return;
+  }
+  for (const issue of issues.slice(0, 8)) {
+    const item = document.createElement("div");
+    item.className = `validation-item ${issue.level || "info"}`;
+    const title = document.createElement("strong");
+    title.textContent = issue.title || "-";
+    item.appendChild(title);
+    if (issue.detail || issue.path) {
+      const detail = document.createElement("span");
+      detail.textContent = [issue.detail, issue.path].filter(Boolean).join(" | ");
+      item.appendChild(detail);
+    }
+    listNode.appendChild(item);
+  }
+  if (issues.length > 8) {
+    const more = document.createElement("div");
+    more.className = "validation-item info";
+    more.textContent = `还有 ${issues.length - 8} 条校验信息`;
+    listNode.appendChild(more);
   }
 }
 
@@ -142,6 +201,8 @@ function refreshObjPreview() {
     {
       obj_o_sources: sample.obj_o_sources || {},
       obj_o_default_source: "output",
+      camera: sample.camera || null,
+      view_cameras: sample.view_cameras || {},
     },
     { force: true, source: "output", view },
   );
@@ -165,7 +226,9 @@ function renderAdminState() {
   $("adminRemark").value = sample.review?.remark || "";
   $("prevSampleBtn").disabled = (data.index || 0) <= 0;
   $("nextSampleBtn").disabled = (data.index || 0) >= (data.total || 1) - 1;
+  renderSampleJump(data, sample.key);
   renderImages(sample);
+  renderValidation(sample);
   renderHistory(sample);
   refreshObjPreview();
   setStatus(sample.needs_review ? "待审核" : "已审核");
@@ -190,13 +253,10 @@ async function saveReview() {
       admin_rating: rating,
       admin_remark: $("adminRemark").value.trim(),
     });
+    await loadSubmissions({ autoload: false, preferredSubmission: submission });
     adminState.data = data;
-    adminState.index = data.index || adminState.index;
+    adminState.index = data.index || 0;
     renderAdminState();
-    await loadSubmissions();
-    adminState.submission = submission;
-    $("submissionSelect").value = submission;
-    await loadSample(adminState.index, sample.key);
     setStatus("审核已保存。");
   } catch (error) {
     setStatus(error.message || String(error), true);
@@ -222,6 +282,7 @@ function initEvents() {
   });
   $("prevSampleBtn").addEventListener("click", () => loadSample(Math.max(0, adminState.index - 1)));
   $("nextSampleBtn").addEventListener("click", () => loadSample(adminState.index + 1));
+  $("adminSampleSelect").addEventListener("change", (event) => loadSample(adminState.index, event.target.value));
   $("saveReviewBtn").addEventListener("click", saveReview);
   $("exportReviewBtn").addEventListener("click", exportReviewRecords);
   $("adminObjViewSelect").addEventListener("change", refreshObjPreview);

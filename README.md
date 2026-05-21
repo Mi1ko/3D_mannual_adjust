@@ -1,6 +1,44 @@
 # Manual Adjust App
 
 这个工具用于对已经规则生成好的 3D 标签布局做人工微调。下面所有路径都以本 app 目录为根目录。
+
+## 获取和更新代码
+
+如果仓库是公开的，其他人可以直接克隆代码：
+
+```powershell
+git clone https://github.com/Mi1ko/3D_mannual_adjust.git
+cd 3D_mannual_adjust
+```
+
+已有本地仓库时，拉取最新代码：
+
+```powershell
+git pull origin main
+```
+
+`data/` 目录已被 Git 忽略，不会随代码仓库上传或下载。每个人需要在自己的本地仓库中准备数据目录，例如：
+
+```powershell
+New-Item -ItemType Directory -Force data/input, data/output, data/admin/pending, data/admin/review_results, data/export, data/temp
+```
+
+把输入数据放入 `data/input`，微调输出、导出 zip 和审核结果会分别写入 `data/output`、`data/export` 和 `data/admin/review_results`。
+
+如果需要使用 admin 页面的 3DLPD 参考数据自动校验，复制本地配置模板并填写自己机器上的数据集路径：
+
+```powershell
+Copy-Item local_config.example.py local_config.py
+```
+
+然后编辑 `local_config.py`：
+
+```python
+REFERENCE_DATASET_ROOT = Path(r"D:\path\to\3DLPD")
+```
+
+`local_config.py` 包含本机路径等固定配置，已被 Git 忽略，不会上传。没有配置时，程序默认查找 `data/reference_3dlpd`，不存在则 admin 校验面板会提示参考目录缺失，但不影响普通微调和审核保存。
+
 ## 常见问题
 
 ### 注意事项
@@ -27,7 +65,7 @@
 
 ### 目录结构
 
-建议直接将整个数据集切片放到 `data/input` 下。在开始新一批任务之前可以清空 `data/output`，本轮所有微调结果都保存到 `data/output`。审核人员收到微调者导出的 zip 后，解压到 `data/admin/<提交包名>` 下审核。
+建议直接将整个数据集切片放到 `data/input` 下。在开始新一批任务之前可以清空 `data/output`，本轮所有微调结果都保存到 `data/output`。审核人员收到微调者导出的 zip 后，解压到 `data/admin/pending/<提交包名>` 下审核。
 
 ## 安装依赖
 
@@ -348,10 +386,10 @@ http://127.0.0.1:8780/admin
 审核人员收到微调者的 zip 后，先解压到：
 
 ```text
-data/admin/<提交包名>/
+data/admin/pending/<提交包名>/
 ```
 
-解压后的目录应直接包含 `manual_adjust_records.json` 和 `Layout/`。admin 页面会扫描 `data/admin` 下所有带记录文件的提交包。
+解压后的目录应直接包含 `manual_adjust_records.json` 和 `Layout/`。admin 页面会扫描 `data/admin/pending` 下所有带记录文件的提交包，审核结果实时写入 `data/admin/review_results/<提交包名>/manual_adjust_records.json`。
 
 admin 页面会显示：
 
