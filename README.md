@@ -4,7 +4,7 @@
 
 ## 获取和更新代码
 
-如果仓库是公开的，其他人可以直接克隆代码：
+
 
 ```powershell
 git clone https://github.com/Mi1ko/3D_mannual_adjust.git
@@ -17,15 +17,10 @@ cd 3D_mannual_adjust
 git pull origin main
 ```
 
-`data/` 目录已被 Git 忽略，不会随代码仓库上传或下载。每个人需要在自己的本地仓库中准备数据目录，例如：
+`data/` 目录已被 Git 忽略，不会随代码仓库上传或下载。每个人需要在自己的本地仓库中准备数据目录，也就是替换 data 目录。
 
-```powershell
-New-Item -ItemType Directory -Force data/input, data/output, data/admin/pending, data/admin/review_results, data/export, data/temp
-```
 
-把输入数据放入 `data/input`，微调输出、导出 zip 和审核结果会分别写入 `data/output`、`data/export` 和 `data/admin/review_results`。
-
-如果需要使用 admin 页面的 3DLPD 参考数据自动校验，复制本地配置模板并填写自己机器上的数据集路径：
+如果需要使用 admin 页面的 3DLPD 参考数据自动校验（审核人员需要，微调人员不需要），复制本地配置模板并填写自己机器上的数据集路径：
 
 ```powershell
 Copy-Item local_config.example.py local_config.py
