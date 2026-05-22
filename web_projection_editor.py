@@ -109,7 +109,17 @@ RATING_LABELS = {
     "bad": "差",
     "unknown": "未知",
 }
+REVIEW_RATING_LABELS = {**RATING_LABELS, "good": "优"}
 REVIEW_RATINGS = {"good", "medium", "bad"}
+REVIEWED_STATUSES = {"reviewed", "changes_required"}
+ADJUSTED_STATUSES = {"adjusted", "pending_recheck"}
+DISPLAY_STATUS_LABELS = {
+    "": "待微调",
+    "adjusted": "已微调待审核",
+    "changes_required": "已审核待修改",
+    "reviewed": "已审核为优",
+}
+RECORDS_SCHEMA_VERSION = 2
 
 
 def normalize_rating(value: str | None, field_name: str = "rating", allow_unknown: bool = False) -> str:
@@ -118,6 +128,127 @@ def normalize_rating(value: str | None, field_name: str = "rating", allow_unknow
     if rating not in valid:
         raise ValueError(f"{field_name} must be one of: good, medium, bad.")
     return rating
+
+
+def review_rating_label(rating: str | None) -> str:
+    return REVIEW_RATING_LABELS.get(str(rating or ""), str(rating or ""))
+
+
+def review_outcome_status(rating: str | None, fallback: str = "reviewed") -> str:
+    value = str(rating or "").strip().lower()
+    if value == "good":
+        return "reviewed"
+    if value in {"medium", "bad"}:
+        return "changes_required"
+    return fallback
+
+
+def canonical_record_status(record: dict | None) -> str:
+    if not record:
+        return ""
+    status = str(record.get("status") or "")
+    if status in REVIEWED_STATUSES:
+        review = record.get("review") if isinstance(record.get("review"), dict) else {}
+        rating = str(review.get("rating") or "")
+        if rating in REVIEW_RATINGS:
+            return review_outcome_status(rating, status)
+    return status
+
+
+def display_status_key(record: dict | None) -> str:
+    status = canonical_record_status(record)
+    if status in ADJUSTED_STATUSES:
+        return "adjusted"
+    if status in REVIEWED_STATUSES:
+        return status
+    return ""
+
+
+def rating_from_label(label: str | None) -> str:
+    normalized = str(label or "").strip()
+    return {
+        "优": "good",
+        "好": "good",
+        "中": "medium",
+        "差": "bad",
+        "未知": "unknown",
+    }.get(normalized, "")
+
+
+def event_from_label(label: str | None) -> str:
+    normalized = str(label or "").strip()
+    if normalized in {"已审核为优", "已微调并审核"}:
+        return "reviewed"
+    if normalized in {"已审核待修改", "已审核需修改"}:
+        return "changes_required"
+    if normalized.startswith("已微调待复核"):
+        return "pending_recheck"
+    if normalized == "已微调待审核":
+        return "adjusted"
+    return ""
+
+
+def normalize_actor_record(value: object, allow_unknown: bool = False) -> dict:
+    if not isinstance(value, dict):
+        return {}
+    result = deepcopy(value)
+    label = result.pop("rating_label", None)
+    if not result.get("rating") and label:
+        rating = rating_from_label(str(label))
+        if rating and (allow_unknown or rating != "unknown"):
+            result["rating"] = rating
+    return result
+
+
+def normalize_history_item(value: object) -> dict | None:
+    if not isinstance(value, dict):
+        return None
+    result = deepcopy(value)
+    label = result.pop("label", None)
+    if not result.get("event") and label:
+        event = event_from_label(str(label))
+        if event:
+            result["event"] = event
+    return result
+
+
+def normalize_sample_record(sample: object, key: str = "") -> dict | None:
+    if not isinstance(sample, dict):
+        return None
+    result = deepcopy(sample)
+    result.pop("status_label", None)
+    result.pop("review_status_label", None)
+    result["adjuster"] = normalize_actor_record(result.get("adjuster"), allow_unknown=True)
+    result["review"] = normalize_actor_record(result.get("review"), allow_unknown=False)
+    result["history"] = [
+        item
+        for item in (normalize_history_item(entry) for entry in (result.get("history") or []))
+        if item is not None
+    ]
+    if key:
+        result.setdefault("key", key)
+    status = str(result.get("status") or "")
+    if status in REVIEWED_STATUSES or (not status and result.get("review", {}).get("rating")):
+        result["status"] = review_outcome_status(result.get("review", {}).get("rating"), status or "reviewed")
+    elif status:
+        result["status"] = status
+    return result
+
+
+def normalize_records_format(data: object) -> dict:
+    records = deepcopy(data) if isinstance(data, dict) else {}
+    records["schema_version"] = RECORDS_SCHEMA_VERSION
+    records.setdefault("updated_at", None)
+    samples = records.get("samples")
+    if not isinstance(samples, dict):
+        samples = {}
+    normalized_samples: dict[str, dict] = {}
+    for key, sample in samples.items():
+        normalized = normalize_sample_record(sample, str(key))
+        if normalized is not None:
+            normalized_samples[str(key)] = normalized
+    records["samples"] = normalized_samples
+    return records
 
 
 def numeric_name_key(value: str) -> tuple[int, int | str]:
@@ -239,25 +370,17 @@ def sample_key(category: str | None, sample_name: str | None) -> str:
 def load_records(root: Path | str | None) -> dict:
     path = records_path(root)
     if not path.is_file():
-        return {"schema_version": 1, "updated_at": None, "samples": {}}
+        return {"schema_version": RECORDS_SCHEMA_VERSION, "updated_at": None, "samples": {}}
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except json.JSONDecodeError as exc:
         raise ValueError(f"Invalid records file: {path}: {exc}") from exc
-    if not isinstance(data, dict):
-        data = {}
-    data.setdefault("schema_version", 1)
-    data.setdefault("updated_at", None)
-    samples = data.get("samples")
-    if not isinstance(samples, dict):
-        samples = {}
-    data["samples"] = samples
-    return data
+    return normalize_records_format(data)
 
 
 def save_records(root: Path | str | None, records: dict) -> Path:
     path = records_path(root)
-    records["schema_version"] = 1
+    records = normalize_records_format(records)
     records["updated_at"] = now_iso()
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(records, indent=2, ensure_ascii=False), encoding="utf-8")
@@ -303,43 +426,17 @@ def manual_output_info(output_root: Path | None, sample_name: str, category: str
 
 
 def review_status_label(record: dict | None) -> str:
-    if not record:
-        return ""
-    status = str(record.get("status") or "")
-    cycle = int(record.get("review_cycle") or 0)
-    if status == "adjusted":
-        return "已微调待审核"
-    if status == "changes_required":
-        return "已审核需修改"
-    if status == "reviewed":
-        return "已微调并审核"
-    if status == "pending_recheck":
-        return f"已微调待复核{cycle or 1}"
-    return ""
-
-
-def record_event_label(event: str, cycle: int = 0) -> str:
-    if event == "adjusted":
-        return "已微调待审核"
-    if event == "reviewed":
-        return "已微调并审核"
-    if event == "changes_required":
-        return "已审核需修改"
-    if event == "pending_recheck":
-        return f"已微调待复核{cycle or 1}"
-    if event == "rechecked":
-        return "已微调并审核"
-    return event
+    return DISPLAY_STATUS_LABELS.get(display_status_key(record), "待微调")
 
 
 def reviewed_for_current_cycle(record: dict | None) -> bool:
-    return bool(record and str(record.get("status") or "") in {"reviewed", "changes_required"})
+    return canonical_record_status(record) in REVIEWED_STATUSES
 
 
 def needs_admin_review(record: dict | None) -> bool:
     if not record:
         return True
-    return str(record.get("status") or "") in {"adjusted", "pending_recheck"}
+    return canonical_record_status(record) in ADJUSTED_STATUSES
 
 
 def validation_issue(level: str, title: str, detail: str = "", path: Path | str | None = None) -> dict:
@@ -971,6 +1068,7 @@ def sample_record_from_json(json_path: Path, output_root: Path | None = None, re
         display = f"{dataset_root.name} / {display}"
     output_info = manual_output_info(output_root or DEFAULT_OUTPUT_ROOT, sample, category)
     sample_record = record_for_sample(records or load_records(output_root or DEFAULT_OUTPUT_ROOT), category, sample)
+    review = sample_record.get("review", {}) if sample_record else {}
     return {
         "name": sample,
         "display_name": display,
@@ -980,13 +1078,13 @@ def sample_record_from_json(json_path: Path, output_root: Path | None = None, re
         "obj_p_path": str(obj_path) if obj_path else "",
         "manual_output_complete": bool(output_info["complete"]),
         "manual_output_layout_dir": output_info.get("layout_dir"),
-        "review_status": str(sample_record.get("status") or "") if sample_record else "",
+        "review_status": display_status_key(sample_record),
         "review_status_label": review_status_label(sample_record),
         "reviewed": reviewed_for_current_cycle(sample_record),
         "needs_admin_review": needs_admin_review(sample_record),
         "self_rating": sample_record.get("adjuster", {}).get("rating") if sample_record else "",
-        "admin_rating": sample_record.get("review", {}).get("rating") if sample_record else "",
-        "admin_rating_label": sample_record.get("review", {}).get("rating_label") if sample_record else "",
+        "admin_rating": review.get("rating") if sample_record else "",
+        "admin_rating_label": review_rating_label(review.get("rating")) if sample_record and review.get("rating") else "",
     }
 
 
@@ -1183,6 +1281,7 @@ def current_state_payload() -> dict:
     output_info = manual_output_info(output_root, sample_name, category)
     records = load_records(output_root)
     current_record = record_for_sample(records, category, sample_name) or {}
+    current_review = current_record.get("review") if isinstance(current_record.get("review"), dict) else {}
     return {
         "loaded": True,
         "dataset_root": str(dataset_root) if dataset_root else None,
@@ -1215,16 +1314,16 @@ def current_state_payload() -> dict:
         "manual_output_info": output_info,
         "records_path": str(records_path(output_root)),
         "current_record": current_record,
-        "review_status": str(current_record.get("status") or ""),
+        "review_status": display_status_key(current_record),
         "review_status_label": review_status_label(current_record),
         "reviewed": reviewed_for_current_cycle(current_record),
         "needs_admin_review": needs_admin_review(current_record),
         "self_rating": current_record.get("adjuster", {}).get("rating") or "",
         "adjuster_remark": current_record.get("adjuster", {}).get("remark") or "",
-        "admin_rating": current_record.get("review", {}).get("rating") or "",
-        "admin_rating_label": current_record.get("review", {}).get("rating_label") or "",
-        "admin_remark": current_record.get("review", {}).get("remark") or "",
-        "admin_reviewer_name": current_record.get("review", {}).get("reviewer_name") or "",
+        "admin_rating": current_review.get("rating") or "",
+        "admin_rating_label": review_rating_label(current_review.get("rating")) if current_review.get("rating") else "",
+        "admin_remark": current_review.get("remark") or "",
+        "admin_reviewer_name": current_review.get("reviewer_name") or "",
     }
 
 
@@ -2208,8 +2307,8 @@ def update_adjustment_record(metadata: dict) -> Path:
     existing = samples.get(key) if isinstance(samples.get(key), dict) else {}
     now = now_iso()
     cycle = int(existing.get("review_cycle") or 0)
-    status = str(existing.get("status") or "")
-    if status in {"reviewed", "changes_required"}:
+    status = canonical_record_status(existing)
+    if status in REVIEWED_STATUSES:
         cycle += 1
         next_status = "pending_recheck"
         event = "pending_recheck"
@@ -2228,7 +2327,6 @@ def update_adjustment_record(metadata: dict) -> Path:
     history.append(
         {
             "event": event,
-            "label": record_event_label(event, cycle),
             "at": now,
             "actor": "adjuster",
             "name": editor_name,
@@ -2250,7 +2348,6 @@ def update_adjustment_record(metadata: dict) -> Path:
         "adjuster": {
             "name": editor_name,
             "rating": rating,
-            "rating_label": RATING_LABELS[rating],
             "remark": remark,
             "updated_at": now,
         },
@@ -2332,7 +2429,6 @@ def ensure_export_records(output_root: Path | str, name: str | None = None) -> d
             "adjuster": {
                 "name": adjuster_name,
                 "rating": "unknown",
-                "rating_label": RATING_LABELS["unknown"],
                 "remark": "",
                 "updated_at": adjusted_at,
             },
@@ -2340,7 +2436,6 @@ def ensure_export_records(output_root: Path | str, name: str | None = None) -> d
             "history": [
                 {
                     "event": "adjusted",
-                    "label": record_event_label("adjusted", 0),
                     "at": adjusted_at,
                     "actor": "adjuster",
                     "name": adjuster_name,
@@ -2351,8 +2446,7 @@ def ensure_export_records(output_root: Path | str, name: str | None = None) -> d
             ],
         }
         created += 1
-    if created:
-        save_records(root, records)
+    save_records(root, records)
     return {"created": created, "records_path": str(records_path(root))}
 
 
@@ -2452,6 +2546,7 @@ def merge_history(local_history: list, imported_history: list) -> list:
 def merge_review_records(output_root: Path | str, imported_records: dict) -> dict:
     if not isinstance(imported_records, dict):
         raise ValueError("Imported review records must be a JSON object.")
+    imported_records = normalize_records_format(imported_records)
     imported_samples = imported_records.get("samples") or {}
     if not isinstance(imported_samples, dict):
         raise ValueError("Imported review records do not contain samples.")
@@ -2470,15 +2565,12 @@ def merge_review_records(output_root: Path | str, imported_records: dict) -> dic
         local_sample = local_samples[key] if isinstance(local_samples[key], dict) else {}
         imported_review_at = parse_iso(imported_review.get("reviewed_at"))
         local_adjusted_at = parse_iso(local_sample.get("adjusted_at"))
-        imported_status = str(imported_sample.get("status") or "")
-        if imported_review.get("rating") == "bad":
-            imported_status = "changes_required"
-        imported_status = imported_status or "reviewed"
+        imported_status = canonical_record_status(imported_sample) or review_outcome_status(imported_review.get("rating"))
         local_sample["review"] = imported_review
         local_sample["review_cycle"] = max(int(local_sample.get("review_cycle") or 0), int(imported_sample.get("review_cycle") or 0))
         local_sample["history"] = merge_history(local_sample.get("history") or [], imported_sample.get("history") or [])
         if not (
-            str(local_sample.get("status") or "") == "pending_recheck"
+            canonical_record_status(local_sample) == "pending_recheck"
             and imported_review_at is not None
             and local_adjusted_at is not None
             and local_adjusted_at > imported_review_at
@@ -2506,7 +2598,7 @@ def admin_review_root_for_submission(submission_root: Path) -> Path:
 def admin_review_applies_to_source(source_sample: dict, review_sample: dict) -> bool:
     if not isinstance(review_sample, dict):
         return False
-    if str(review_sample.get("status") or "") not in {"reviewed", "changes_required"}:
+    if canonical_record_status(review_sample) not in REVIEWED_STATUSES:
         return False
     source_cycle = int(source_sample.get("review_cycle") or 0)
     review_cycle = int(review_sample.get("review_cycle") or 0)
@@ -2515,7 +2607,7 @@ def admin_review_applies_to_source(source_sample: dict, review_sample: dict) -> 
     reviewed_at = parse_iso((review_sample.get("review") or {}).get("reviewed_at"))
     adjusted_at = parse_iso(source_sample.get("adjusted_at") or (source_sample.get("adjuster") or {}).get("updated_at"))
     if (
-        str(source_sample.get("status") or "") in {"adjusted", "pending_recheck"}
+        canonical_record_status(source_sample) in ADJUSTED_STATUSES
         and reviewed_at is not None
         and adjusted_at is not None
         and adjusted_at > reviewed_at
@@ -2538,6 +2630,7 @@ def merge_admin_review_records(source_records: dict, review_records: dict) -> di
             for field in ("status", "review_cycle", "review", "history"):
                 if field in review_sample:
                     sample[field] = deepcopy(review_sample[field])
+            sample["status"] = canonical_record_status(sample)
         samples[key] = sample
     merged["samples"] = samples
     return merged
@@ -2612,12 +2705,36 @@ def record_sort_key(item: tuple[str, dict]) -> tuple[int, str, tuple[int, int | 
     return (rating_rank, str(sample.get("category") or ""), numeric_name_key(str(sample.get("sample_id") or key)))
 
 
-def admin_sample_summaries(submission_root: Path) -> list[dict]:
+def sample_matches_status_filter(sample: dict | None, status_filter: str | None = "all") -> bool:
+    value = str(status_filter or "all")
+    if value == "all":
+        return True
+    status = display_status_key(sample)
+    if value == "none":
+        return status == ""
+    return status == value
+
+
+def normalize_admin_review_mode(value: str | None) -> str:
+    return "review" if str(value or "").strip().lower() == "review" else "view"
+
+
+def admin_sample_summaries(
+    submission_root: Path,
+    status_filter: str | None = "all",
+    review_mode: str | None = "view",
+) -> list[dict]:
     records = load_admin_effective_records(submission_root)
     samples = records.get("samples") or {}
+    mode = normalize_admin_review_mode(review_mode)
     summaries = []
     for key, sample in sorted(samples.items(), key=record_sort_key):
         if not isinstance(sample, dict):
+            continue
+        if not sample_matches_status_filter(sample, status_filter):
+            continue
+        needs_review = needs_admin_review(sample)
+        if mode == "review" and not needs_review:
             continue
         summaries.append(
             {
@@ -2626,20 +2743,28 @@ def admin_sample_summaries(submission_root: Path) -> list[dict]:
                 "sample_id": sample.get("sample_id") or "",
                 "adjuster_name": sample.get("adjuster", {}).get("name") or "",
                 "self_rating": sample.get("adjuster", {}).get("rating") or "",
-                "self_rating_label": sample.get("adjuster", {}).get("rating_label") or RATING_LABELS.get(sample.get("adjuster", {}).get("rating"), ""),
-                "status": sample.get("status") or "",
+                "self_rating_label": RATING_LABELS.get(sample.get("adjuster", {}).get("rating"), ""),
+                "status": display_status_key(sample),
                 "status_label": review_status_label(sample),
                 "reviewed": reviewed_for_current_cycle(sample),
-                "needs_review": needs_admin_review(sample),
+                "needs_review": needs_review,
             }
         )
     return summaries
 
 
-def admin_sample_payload(submission_root: Path, index: int = 0, sample_key_value: str | None = None) -> dict:
+def admin_sample_payload(
+    submission_root: Path,
+    index: int = 0,
+    sample_key_value: str | None = None,
+    status_filter: str | None = "all",
+    review_mode: str | None = "view",
+) -> dict:
     records = load_admin_effective_records(submission_root)
     samples = records.get("samples") or {}
-    summaries = admin_sample_summaries(submission_root)
+    mode = normalize_admin_review_mode(review_mode)
+    all_summaries = admin_sample_summaries(submission_root, "all", "view")
+    summaries = admin_sample_summaries(submission_root, status_filter, mode)
     if not summaries:
         return {
             "submission": str(submission_root),
@@ -2647,7 +2772,11 @@ def admin_sample_payload(submission_root: Path, index: int = 0, sample_key_value
             "current": None,
             "index": 0,
             "total": 0,
-            "reviewed_count": 0,
+            "overall_total": len(all_summaries),
+            "reviewed_count": sum(1 for item in all_summaries if item["reviewed"]),
+            "pending_count": sum(1 for item in all_summaries if item["needs_review"]),
+            "status_filter": str(status_filter or "all"),
+            "review_mode": mode,
         }
     if sample_key_value:
         index = next((cursor for cursor, item in enumerate(summaries) if item["key"] == sample_key_value), index)
@@ -2706,8 +2835,11 @@ def admin_sample_payload(submission_root: Path, index: int = 0, sample_key_value
         "current": current,
         "index": index,
         "total": len(summaries),
-        "reviewed_count": sum(1 for item in summaries if item["reviewed"]),
-        "pending_count": sum(1 for item in summaries if item["needs_review"]),
+        "overall_total": len(all_summaries),
+        "reviewed_count": sum(1 for item in all_summaries if item["reviewed"]),
+        "pending_count": sum(1 for item in all_summaries if item["needs_review"]),
+        "status_filter": str(status_filter or "all"),
+        "review_mode": mode,
     }
 
 
@@ -2726,18 +2858,19 @@ def save_admin_review(submission_name: str, payload: dict) -> dict:
         raise KeyError(f"Sample not found in records: {key}")
     now = now_iso()
     cycle = int(sample.get("review_cycle") or 0)
-    previous_status = str(sample.get("status") or "")
+    previous_status = canonical_record_status(sample)
+    if previous_status in REVIEWED_STATUSES:
+        raise ValueError(f"{review_status_label(sample)}，无需再次审核。")
     event = "rechecked" if previous_status == "pending_recheck" or cycle > 0 else "reviewed"
     if event == "rechecked" and cycle <= 0:
         cycle = 1
-    next_status = "changes_required" if rating == "bad" else "reviewed"
-    history_event = "changes_required" if rating == "bad" else event
+    next_status = review_outcome_status(rating)
+    history_event = "changes_required" if next_status == "changes_required" else event
     sample["status"] = next_status
     sample["review_cycle"] = cycle
     sample["review"] = {
         "reviewer_name": reviewer_name,
         "rating": rating,
-        "rating_label": RATING_LABELS[rating],
         "remark": remark,
         "reviewed_at": now,
     }
@@ -2745,7 +2878,6 @@ def save_admin_review(submission_name: str, payload: dict) -> dict:
     history.append(
         {
             "event": history_event,
-            "label": record_event_label(history_event, cycle),
             "at": now,
             "actor": "admin",
             "name": reviewer_name,
@@ -2758,15 +2890,19 @@ def save_admin_review(submission_name: str, payload: dict) -> dict:
     review_records = load_records(review_root)
     review_records.setdefault("samples", {})[key] = sample
     save_records(review_root, review_records)
-    return admin_sample_payload(submission_root, sample_key_value=key)
+    return admin_sample_payload(
+        submission_root,
+        sample_key_value=key,
+        status_filter=payload.get("status_filter") or "all",
+        review_mode=payload.get("review_mode") or "view",
+    )
 
 
 def admin_records_download(submission_name: str) -> tuple[bytes, str]:
     submission_root = admin_submission_root(submission_name)
     review_root = admin_review_root_for_submission(submission_root)
     path = records_path(review_root)
-    if not path.is_file():
-        save_records(review_root, load_records(review_root))
+    save_records(review_root, load_records(review_root))
     filename = f"{safe_filename_stem(submission_root.name, 'admin')}_review_records_{datetime.now().strftime('%Y%m%d')}.json"
     return path.read_bytes(), filename
 
@@ -2835,7 +2971,9 @@ class EditorHandler(SimpleHTTPRequestHandler):
             submission = unquote(query.get("submission", ["."])[0]).strip()
             index = int(query.get("index", ["0"])[0] or 0)
             key = unquote(query.get("key", [""])[0]).strip() or None
-            json_response(self, admin_sample_payload(admin_submission_root(submission), index, key))
+            status_filter = unquote(query.get("status_filter", ["all"])[0]).strip() or "all"
+            review_mode = unquote(query.get("review_mode", ["view"])[0]).strip() or "view"
+            json_response(self, admin_sample_payload(admin_submission_root(submission), index, key, status_filter, review_mode))
             return
         if parsed.path == "/api/admin/export_records":
             try:

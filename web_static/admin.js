@@ -4,9 +4,18 @@ const adminState = {
   data: null,
   index: 0,
   objView: "main",
+  statusFilter: "all",
+  reviewMode: "review",
 };
 
-const ratingLabels = { good: "好", medium: "中", bad: "差", unknown: "未知" };
+const selfRatingLabels = { good: "好", medium: "中", bad: "差", unknown: "未知" };
+const reviewRatingLabels = { good: "优", medium: "中", bad: "差", unknown: "未知" };
+const sampleStatusLabels = {
+  "": "待微调",
+  adjusted: "已微调待审核",
+  changes_required: "已审核待修改",
+  reviewed: "已审核为优",
+};
 const imageIds = {
   main: "adminImgMain",
   up: "adminImgUp",
@@ -16,6 +25,29 @@ const imageIds = {
 };
 
 const $ = (id) => document.getElementById(id);
+
+function projectPathDisplay(value) {
+  const text = String(value || "");
+  const normalized = text.replace(/\//g, "\\");
+  const marker = "manual_adjust_app";
+  const index = normalized.toLowerCase().lastIndexOf(marker.toLowerCase());
+  return index >= 0 ? `……\\${normalized.slice(index)}` : normalized;
+}
+
+function shortenMiddle(value, maxLength = 58) {
+  const text = projectPathDisplay(value);
+  if (text.length <= maxLength) return text;
+  const marker = "……";
+  const projectPrefix = text.match(/^……\\manual_adjust_app(?:\\data)?/i)?.[0] || "";
+  if (projectPrefix && projectPrefix.length + 8 < maxLength) {
+    const tailLength = Math.max(8, maxLength - projectPrefix.length - marker.length);
+    return `${projectPrefix}${marker}${text.slice(text.length - tailLength)}`;
+  }
+  const keep = Math.max(8, maxLength - marker.length);
+  const head = Math.ceil(keep * 0.52);
+  const tail = Math.floor(keep * 0.48);
+  return `${text.slice(0, head)}${marker}${text.slice(text.length - tail)}`;
+}
 
 function fileUrl(path) {
   return `/api/file?path=${encodeURIComponent(path)}&t=${Date.now()}`;
@@ -58,6 +90,131 @@ function selectedSubmission() {
   return $("submissionSelect")?.value || adminState.submission || ".";
 }
 
+function selectedStatusFilter() {
+  return $("adminStatusFilter")?.value || adminState.statusFilter || "all";
+}
+
+function selectedReviewMode() {
+  return $("adminReviewMode")?.value || adminState.reviewMode || "review";
+}
+
+function statusLabelForSample(sample) {
+  return sample?.status_label || sampleStatusLabels[sample?.status || ""] || "待微调";
+}
+
+let mediaModalRestore = null;
+
+function stripElementIds(root) {
+  root.removeAttribute?.("id");
+  root.querySelectorAll?.("[id]").forEach((node) => node.removeAttribute("id"));
+}
+
+function ensureMediaModal() {
+  let modal = $("mediaModal");
+  if (modal) return modal;
+  modal = document.createElement("div");
+  modal.id = "mediaModal";
+  modal.className = "media-modal";
+  modal.hidden = true;
+  modal.innerHTML = `
+    <div class="media-modal-panel" role="dialog" aria-modal="true" aria-labelledby="mediaModalTitle">
+      <header class="media-modal-header">
+        <button class="media-modal-close" type="button" aria-label="关闭"></button>
+        <strong id="mediaModalTitle">预览</strong>
+      </header>
+      <div class="media-modal-body"></div>
+    </div>
+  `;
+  modal.addEventListener("click", (event) => {
+    if (event.target === modal) closeMediaModal();
+  });
+  modal.querySelector(".media-modal-close")?.addEventListener("click", closeMediaModal);
+  document.body.appendChild(modal);
+  return modal;
+}
+
+function closeMediaModal() {
+  const modal = $("mediaModal");
+  if (!modal) return;
+  mediaModalRestore?.();
+  mediaModalRestore = null;
+  modal.hidden = true;
+  modal.querySelector(".media-modal-body").innerHTML = "";
+  modal.querySelector(".media-modal-body").className = "media-modal-body";
+  document.body.classList.remove("modal-open");
+  window.resizeObjOView?.();
+}
+
+function openMediaModal(title) {
+  const modal = ensureMediaModal();
+  modal.querySelector("#mediaModalTitle").textContent = title || "预览";
+  modal.hidden = false;
+  document.body.classList.add("modal-open");
+  return modal.querySelector(".media-modal-body");
+}
+
+function openImageModal(card) {
+  const title = card.querySelector("header")?.childNodes?.[0]?.textContent?.trim() || "投影预览";
+  const body = openMediaModal(title);
+  const img = card.querySelector("img");
+  if (img?.src) {
+    const clone = img.cloneNode(true);
+    stripElementIds(clone);
+    clone.classList.add("modal-image");
+    body.appendChild(clone);
+  } else {
+    body.textContent = "当前没有可放大的图像。";
+  }
+}
+
+function openObjModal(card) {
+  const shell = card.querySelector(".obj-viewer-shell");
+  if (!shell) return;
+  const body = openMediaModal("OBJ-O");
+  body.classList.add("contains-obj");
+  const placeholder = document.createComment("obj-viewer-placeholder");
+  const originalParent = shell.parentNode;
+  originalParent.insertBefore(placeholder, shell);
+  body.appendChild(shell);
+  mediaModalRestore = () => {
+    if (placeholder.parentNode) {
+      placeholder.parentNode.insertBefore(shell, placeholder);
+      placeholder.remove();
+    } else {
+      originalParent.appendChild(shell);
+    }
+  };
+  window.setTimeout(() => window.resizeObjOView?.(), 40);
+}
+
+function addFullscreenButtons() {
+  document.querySelectorAll(".admin-image-card, .admin-obj-panel").forEach((card) => {
+    const header = card.querySelector(":scope > header");
+    if (!header || header.querySelector(".fullscreen-btn")) return;
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "fullscreen-btn";
+    button.title = "放大";
+    button.setAttribute("aria-label", "放大");
+    button.addEventListener("click", () => {
+      if (card.classList.contains("admin-obj-panel")) openObjModal(card);
+      else openImageModal(card);
+    });
+    header.appendChild(button);
+  });
+}
+
+function historyLabelForItem(item) {
+  if (!item) return "-";
+  if (item.actor === "admin" && item.rating) {
+    return item.rating === "good" ? sampleStatusLabels.reviewed : sampleStatusLabels.changes_required;
+  }
+  if (item.event === "reviewed" || item.event === "rechecked") return sampleStatusLabels.reviewed;
+  if (item.event === "changes_required") return sampleStatusLabels.changes_required;
+  if (item.event === "adjusted" || item.event === "pending_recheck") return sampleStatusLabels.adjusted;
+  return item.label || item.event || "-";
+}
+
 function populateSubmissions(data, preferredSubmission = adminState.submission) {
   adminState.submissions = data.submissions || [];
   const select = $("submissionSelect");
@@ -91,7 +248,14 @@ async function loadSubmissions(options = {}) {
 
 async function loadSample(index = adminState.index, key = "") {
   adminState.submission = selectedSubmission();
-  const params = new URLSearchParams({ submission: adminState.submission, index: String(index) });
+  adminState.statusFilter = selectedStatusFilter();
+  adminState.reviewMode = selectedReviewMode();
+  const params = new URLSearchParams({
+    submission: adminState.submission,
+    index: String(index),
+    status_filter: adminState.statusFilter,
+    review_mode: adminState.reviewMode,
+  });
   if (key) params.set("key", key);
   const data = await getJson(`/api/admin/sample?${params.toString()}`);
   adminState.data = data;
@@ -103,14 +267,23 @@ function renderEmpty() {
   $("progressText").textContent = "-";
   $("sampleCounter").textContent = "-";
   $("adminSampleTitle").textContent = "未加载";
+  document.querySelector(".admin-sample-title")?.classList.remove("reviewed-sample");
+  const hint = $("adminReviewedHint");
+  if (hint) {
+    hint.hidden = true;
+    hint.textContent = "无需再次审核";
+  }
   renderSampleJump(null);
   $("adjusterName").textContent = "-";
   $("selfRatingText").textContent = "-";
-  $("reviewStatusText").textContent = "-";
+  $("reviewStatusText").textContent = "待微调";
   $("selfRemarkText").textContent = "-";
   renderValidation(null);
   $("adminRating").value = "";
   $("adminRemark").value = "";
+  $("saveReviewBtn").disabled = true;
+  $("prevSampleBtn").disabled = true;
+  $("nextSampleBtn").disabled = true;
   for (const id of Object.values(imageIds)) $(id)?.removeAttribute("src");
   window.clearObjOPreview?.();
 }
@@ -134,7 +307,7 @@ function renderSampleJump(data, currentKey = "") {
   for (const [index, sample] of samples.entries()) {
     const option = document.createElement("option");
     option.value = sample.key;
-    const status = sample.status_label || (sample.reviewed ? "已审核" : "待审核");
+    const status = statusLabelForSample(sample);
     option.textContent = `${index + 1}. ${sample.category}/${sample.sample_id} · ${status}`;
     select.appendChild(option);
   }
@@ -166,7 +339,8 @@ function renderValidation(sample) {
     item.appendChild(title);
     if (issue.detail || issue.path) {
       const detail = document.createElement("span");
-      detail.textContent = [issue.detail, issue.path].filter(Boolean).join(" | ");
+      detail.textContent = [issue.detail, issue.path ? shortenMiddle(issue.path, 66) : ""].filter(Boolean).join(" | ");
+      if (issue.path) detail.title = issue.path;
       item.appendChild(detail);
     }
     listNode.appendChild(item);
@@ -186,8 +360,10 @@ function renderHistory(sample) {
   node.innerHTML = history
     .map((item) => {
       const cycle = Number(item.cycle || 0) > 0 ? ` #${item.cycle}` : "";
-      const rating = item.rating ? ` · ${ratingLabels[item.rating] || item.rating}` : "";
-      return `<div><strong>${item.label || item.event || "-"}${item.label ? "" : cycle}</strong><span>${item.at || ""}${rating}</span></div>`;
+      const labels = item.actor === "admin" ? reviewRatingLabels : selfRatingLabels;
+      const rating = item.rating ? ` · ${labels[item.rating] || item.rating}` : "";
+      const label = historyLabelForItem(item);
+      return `<div><strong>${label}${label === (item.event || "") ? cycle : ""}</strong><span>${item.at || ""}${rating}</span></div>`;
     })
     .join("");
 }
@@ -213,17 +389,33 @@ function renderAdminState() {
   const sample = currentSample();
   if (!sample) {
     renderEmpty();
+    if (data) {
+      const overallTotal = data.overall_total ?? data.total ?? 0;
+      $("progressText").textContent = `已审查 ${data.reviewed_count || 0} / ${overallTotal}`;
+      setStatus(data.review_mode === "review" ? "审核模式下没有需要审核的样本。" : "当前状态筛选下没有样本。", true);
+    }
     return;
   }
-  $("progressText").textContent = `已审查 ${data.reviewed_count || 0} / ${data.total || 0}`;
+  const overallTotal = data.overall_total ?? data.total ?? 0;
+  $("progressText").textContent = `已审查 ${data.reviewed_count || 0} / ${overallTotal}`;
   $("sampleCounter").textContent = `${(data.index || 0) + 1} / ${data.total || 0}`;
   $("adminSampleTitle").textContent = `${sample.category} / ${sample.sample_id}`;
+  const statusLabel = statusLabelForSample(sample);
+  const titleBox = document.querySelector(".admin-sample-title");
+  titleBox?.classList.toggle("reviewed-sample", !sample.needs_review);
+  const hint = $("adminReviewedHint");
+  if (hint) {
+    hint.hidden = Boolean(sample.needs_review);
+    hint.textContent = sample.needs_review ? "无需再次审核" : `${statusLabel}，无需再次审核`;
+  }
   $("adjusterName").textContent = sample.adjuster?.name || sample.adjuster_name || "-";
-  $("selfRatingText").textContent = sample.adjuster?.rating_label || ratingLabels[sample.self_rating] || "-";
-  $("reviewStatusText").textContent = sample.status_label || (sample.reviewed ? "已审核" : "待审核");
+  $("selfRatingText").textContent = sample.adjuster?.rating_label || selfRatingLabels[sample.self_rating] || "-";
+  $("reviewStatusText").textContent = statusLabel;
   $("selfRemarkText").textContent = sample.adjuster?.remark || "无";
   $("adminRating").value = sample.review?.rating || "";
   $("adminRemark").value = sample.review?.remark || "";
+  $("saveReviewBtn").disabled = !sample.needs_review;
+  $("saveReviewBtn").title = sample.needs_review ? "保存审核信息" : `${statusLabel}，无需再次审核`;
   $("prevSampleBtn").disabled = (data.index || 0) <= 0;
   $("nextSampleBtn").disabled = (data.index || 0) >= (data.total || 1) - 1;
   renderSampleJump(data, sample.key);
@@ -231,12 +423,16 @@ function renderAdminState() {
   renderValidation(sample);
   renderHistory(sample);
   refreshObjPreview();
-  setStatus(sample.needs_review ? "待审核" : "已审核");
+  setStatus(sample.needs_review ? "待审核" : `${statusLabel}，无需再次审核`);
 }
 
 async function saveReview() {
   const sample = currentSample();
   if (!sample) return;
+  if (!sample.needs_review) {
+    setStatus(`${statusLabelForSample(sample)}，无需再次审核。`, true);
+    return;
+  }
   const rating = $("adminRating").value;
   if (!rating) {
     $("adminRating").focus();
@@ -246,18 +442,22 @@ async function saveReview() {
   try {
     setStatus("正在保存审核...");
     const submission = selectedSubmission();
-    const data = await postJson("/api/admin/review", {
+    const statusFilter = selectedStatusFilter();
+    const reviewMode = selectedReviewMode();
+    const previousIndex = adminState.index || 0;
+    await postJson("/api/admin/review", {
       submission,
       sample_key: sample.key,
       reviewer_name: $("reviewerName").value.trim(),
       admin_rating: rating,
       admin_remark: $("adminRemark").value.trim(),
+      status_filter: statusFilter,
+      review_mode: reviewMode,
     });
     await loadSubmissions({ autoload: false, preferredSubmission: submission });
-    adminState.data = data;
-    adminState.index = data.index || 0;
-    renderAdminState();
-    setStatus("审核已保存。");
+    const nextIndex = reviewMode === "review" || statusFilter !== "all" ? previousIndex : previousIndex + 1;
+    await loadSample(nextIndex);
+    setStatus("审核已保存，已跳到下一个样本。");
   } catch (error) {
     setStatus(error.message || String(error), true);
   }
@@ -268,7 +468,7 @@ async function exportReviewRecords() {
   try {
     setStatus("正在导出审核文件...");
     const result = await getJson(`/api/admin/export_records?${params.toString()}`);
-    setStatus(`审核文件已导出：${result.path}`);
+    setStatus(`审核文件已导出：${shortenMiddle(result.path, 72)}`);
     window.alert(`导出成功，文件已保存到：\n${result.path}`);
   } catch (error) {
     setStatus(error.message || String(error), true);
@@ -276,8 +476,19 @@ async function exportReviewRecords() {
 }
 
 function initEvents() {
+  document.addEventListener("keydown", (event) => {
+    if (event.key === "Escape" && !$("mediaModal")?.hidden) closeMediaModal();
+  });
   $("submissionSelect").addEventListener("change", async (event) => {
     adminState.submission = event.target.value;
+    await loadSample(0);
+  });
+  $("adminStatusFilter").addEventListener("change", async (event) => {
+    adminState.statusFilter = event.target.value;
+    await loadSample(0);
+  });
+  $("adminReviewMode").addEventListener("change", async (event) => {
+    adminState.reviewMode = event.target.value;
     await loadSample(0);
   });
   $("prevSampleBtn").addEventListener("click", () => loadSample(Math.max(0, adminState.index - 1)));
@@ -292,6 +503,7 @@ function initEvents() {
 window.addEventListener("obj-o-viewer-ready", refreshObjPreview);
 
 async function init() {
+  addFullscreenButtons();
   initEvents();
   try {
     await loadSubmissions();

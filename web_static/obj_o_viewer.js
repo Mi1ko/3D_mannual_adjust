@@ -6,7 +6,7 @@ import { OBJLoader } from "three/addons/loaders/OBJLoader.js";
 const canvas = document.getElementById("objOCanvas");
 const empty = document.getElementById("objOEmpty");
 const isAdminViewer = document.body?.classList.contains("admin-page");
-const initialZoom = isAdminViewer ? 0.9 : 1.15;
+const initialZoom = isAdminViewer ? 0.9 : 1.0;
 
 let renderer = null;
 let scene = null;
@@ -274,6 +274,7 @@ window.resetObjOView = () => {
     loadPreview(lastData, { force: true, source: loadedSource, view: loadedView, tempStale: loadedTempStale });
   }
 };
+window.resizeObjOView = resizeViewer;
 window.clearObjOPreview = () => {
   ensureViewer();
   loadSerial += 1;

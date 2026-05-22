@@ -32,12 +32,192 @@ const sliderIds = ["sliderX", "sliderY", "sliderZ"];
 const axisNames = ["x", "y", "z"];
 const axisColors = { "+x": "#d94733", "+y": "#2368b8", "+z": "#218354" };
 const ratingLabels = { good: "好", medium: "中", bad: "差", unknown: "未知" };
+const reviewRatingLabels = { good: "优", medium: "中", bad: "差", unknown: "未知" };
+const sampleStatusLabels = {
+  "": "待微调",
+  adjusted: "已微调待审核",
+  changes_required: "已审核待修改",
+  reviewed: "已审核为优",
+};
 const minVisibleMove = 0.12;
 const moveTraceMinDistance = 1e-4;
 const objOSourceLabels = { input: "输入状态", output: "输出状态", temp: "微调中" };
 const viewLabels = { main: "主视角", up: "上视角", down: "下视角", left: "左视角", right: "右视角" };
 
 const $ = (id) => document.getElementById(id);
+const pathInputIds = ["datasetRoot", "outputRoot", "annotationPath", "objPath"];
+
+function projectPathDisplay(value) {
+  const text = String(value || "");
+  const normalized = text.replace(/\//g, "\\");
+  const marker = "manual_adjust_app";
+  const index = normalized.toLowerCase().lastIndexOf(marker.toLowerCase());
+  return index >= 0 ? `……\\${normalized.slice(index)}` : normalized;
+}
+
+function shortenMiddle(value, maxLength = 56) {
+  const text = projectPathDisplay(value);
+  if (text.length <= maxLength) return text;
+  const marker = "……";
+  const projectPrefix = text.match(/^……\\manual_adjust_app(?:\\data)?/i)?.[0] || "";
+  if (projectPrefix && projectPrefix.length + 8 < maxLength) {
+    const tailLength = Math.max(8, maxLength - projectPrefix.length - marker.length);
+    return `${projectPrefix}${marker}${text.slice(text.length - tailLength)}`;
+  }
+  const keep = Math.max(8, maxLength - marker.length);
+  const head = Math.ceil(keep * 0.52);
+  const tail = Math.floor(keep * 0.48);
+  return `${text.slice(0, head)}${marker}${text.slice(text.length - tail)}`;
+}
+
+function pathLimitForInput(id) {
+  if (id === "annotationPath" || id === "objPath") return 48;
+  return 58;
+}
+
+function pathInputValue(id) {
+  const node = $(id);
+  return String(node?.dataset.fullValue ?? node?.value ?? "").trim();
+}
+
+function setPathInputValue(id, value) {
+  const node = $(id);
+  if (!node) return;
+  const fullValue = String(value || "");
+  node.dataset.fullValue = fullValue;
+  node.title = fullValue;
+  const shouldShowFull = document.activeElement === node;
+  node.value = shouldShowFull ? fullValue : shortenMiddle(fullValue, pathLimitForInput(id));
+}
+
+function bindPathInputs() {
+  for (const id of pathInputIds) {
+    const node = $(id);
+    if (!node) continue;
+    node.dataset.fullValue = node.value || "";
+    node.title = node.dataset.fullValue;
+    node.addEventListener("focus", () => {
+      node.value = node.dataset.fullValue || "";
+    });
+    node.addEventListener("input", () => {
+      node.dataset.fullValue = node.value;
+      node.title = node.value;
+    });
+    node.addEventListener("blur", () => {
+      setPathInputValue(id, node.dataset.fullValue || node.value || "");
+    });
+  }
+}
+
+let mediaModalRestore = null;
+
+function stripElementIds(root) {
+  root.removeAttribute?.("id");
+  root.querySelectorAll?.("[id]").forEach((node) => node.removeAttribute("id"));
+}
+
+function ensureMediaModal() {
+  let modal = $("mediaModal");
+  if (modal) return modal;
+  modal = document.createElement("div");
+  modal.id = "mediaModal";
+  modal.className = "media-modal";
+  modal.hidden = true;
+  modal.innerHTML = `
+    <div class="media-modal-panel" role="dialog" aria-modal="true" aria-labelledby="mediaModalTitle">
+      <header class="media-modal-header">
+        <button class="media-modal-close" type="button" aria-label="关闭"></button>
+        <strong id="mediaModalTitle">预览</strong>
+      </header>
+      <div class="media-modal-body"></div>
+    </div>
+  `;
+  modal.addEventListener("click", (event) => {
+    if (event.target === modal) closeMediaModal();
+  });
+  modal.querySelector(".media-modal-close")?.addEventListener("click", closeMediaModal);
+  document.body.appendChild(modal);
+  return modal;
+}
+
+function closeMediaModal() {
+  const modal = $("mediaModal");
+  if (!modal) return;
+  mediaModalRestore?.();
+  mediaModalRestore = null;
+  modal.hidden = true;
+  modal.querySelector(".media-modal-body").innerHTML = "";
+  modal.querySelector(".media-modal-body").className = "media-modal-body";
+  document.body.classList.remove("modal-open");
+  window.resizeObjOView?.();
+}
+
+function openMediaModal(title) {
+  const modal = ensureMediaModal();
+  modal.querySelector("#mediaModalTitle").textContent = title || "预览";
+  modal.hidden = false;
+  document.body.classList.add("modal-open");
+  return modal.querySelector(".media-modal-body");
+}
+
+function openImageModal(card) {
+  const headerText = card.querySelector("header")?.childNodes?.[0]?.textContent?.trim() || "投影预览";
+  const body = openMediaModal(headerText);
+  const frame = card.querySelector(".image-frame");
+  if (frame) {
+    const clone = frame.cloneNode(true);
+    stripElementIds(clone);
+    clone.classList.add("modal-image-frame");
+    body.appendChild(clone);
+  } else {
+    const img = card.querySelector("img");
+    if (img?.src) {
+      const clone = img.cloneNode(true);
+      stripElementIds(clone);
+      clone.classList.add("modal-image");
+      body.appendChild(clone);
+    } else {
+      body.textContent = "当前没有可放大的图像。";
+    }
+  }
+}
+
+function openObjModal(card) {
+  const shell = card.querySelector(".obj-viewer-shell");
+  if (!shell) return;
+  const body = openMediaModal("OBJ-O");
+  body.classList.add("contains-obj");
+  const placeholder = document.createComment("obj-viewer-placeholder");
+  const originalParent = shell.parentNode;
+  originalParent.insertBefore(placeholder, shell);
+  body.appendChild(shell);
+  mediaModalRestore = () => {
+    if (placeholder.parentNode) {
+      placeholder.parentNode.insertBefore(shell, placeholder);
+      placeholder.remove();
+    } else {
+      originalParent.appendChild(shell);
+    }
+  };
+  window.setTimeout(() => window.resizeObjOView?.(), 40);
+}
+
+function addFullscreenButtons() {
+  document.querySelectorAll(".view-card").forEach((card) => {
+    const header = card.querySelector(":scope > header");
+    if (!header || header.querySelector(".fullscreen-btn")) return;
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "fullscreen-btn";
+    button.title = "放大";
+    button.setAttribute("aria-label", "放大");
+    button.addEventListener("click", () => {
+      if (card.classList.contains("obj-preview-card")) openObjModal(card);
+      else openImageModal(card);
+    });
+    header.appendChild(button);
+  });
+}
 
 function sampleOptionText(sample) {
   const suffixes = [];
@@ -54,8 +234,19 @@ function sampleMatchesStatusFilter(sample, filter = statusFilterValue()) {
   const status = sample?.review_status || "";
   if (filter === "all") return true;
   if (filter === "none") return !status;
-  if (filter === "pending_recheck") return status === "pending_recheck";
   return status === filter;
+}
+
+function statusLabelForSample(sample) {
+  return sample?.review_status_label || sampleStatusLabels[sample?.review_status || ""] || "待微调";
+}
+
+function setReviewStatusText(value) {
+  const node = $("reviewStatusText");
+  if (!node) return;
+  const text = value || "待微调";
+  if ("value" in node) node.value = text;
+  else node.textContent = text;
 }
 
 function renderSampleOptions(preferredAnnotationPath = "") {
@@ -123,7 +314,9 @@ async function postJson(url, payload) {
 
 function setStatus(message, isError = false) {
   const node = $("statusText");
-  node.textContent = message;
+  const text = String(message || "");
+  node.textContent = text;
+  node.title = text;
   node.classList.toggle("error", Boolean(isError));
 }
 
@@ -622,7 +815,7 @@ function requireSelfRating(actionLabel = "保存") {
 }
 
 function outputPayload() {
-  return { output_root: $("outputRoot").value.trim() };
+  return { output_root: pathInputValue("outputRoot") };
 }
 
 function metadataPayload() {
@@ -650,13 +843,13 @@ function payloadFromState(options = {}) {
 async function refreshSamples(options = {}) {
   showStageToast("正在刷新文件列表...");
   try {
-    const root = $("datasetRoot").value.trim();
-    const outputRoot = $("outputRoot").value.trim();
+    const root = pathInputValue("datasetRoot");
+    const outputRoot = pathInputValue("outputRoot");
     const data = await getJson(`/api/samples?root=${encodeURIComponent(root)}&output_root=${encodeURIComponent(outputRoot)}`);
     appState.allSamples = data.samples || [];
     const selected = renderSampleOptions();
     if (appState.samples.length) {
-      const firstOpen = appState.samples.find((sample) => !sample.review_status) || selected;
+      const firstOpen = appState.samples.find((sample) => sample.review_status !== "reviewed") || selected;
       selectSample(firstOpen.annotation_path);
       finishStageToast("文件列表刷新完成");
       if (options.autoLoad) {
@@ -676,8 +869,8 @@ async function refreshSamples(options = {}) {
 }
 
 async function refreshSamplesPreservingCurrent(preferredAnnotationPath) {
-  const root = $("datasetRoot").value.trim();
-  const outputRoot = $("outputRoot").value.trim();
+  const root = pathInputValue("datasetRoot");
+  const outputRoot = pathInputValue("outputRoot");
   const data = await getJson(`/api/samples?root=${encodeURIComponent(root)}&output_root=${encodeURIComponent(outputRoot)}`);
   appState.allSamples = data.samples || [];
   renderSampleOptions(preferredAnnotationPath);
@@ -685,8 +878,8 @@ async function refreshSamplesPreservingCurrent(preferredAnnotationPath) {
   if (matched) {
     appState.selectedSample = matched;
     if (sampleMatchesStatusFilter(matched) && $("sampleSelect")) $("sampleSelect").value = matched.annotation_path;
-    $("annotationPath").value = matched.annotation_path || "";
-    $("objPath").value = matched.obj_p_path || "";
+    setPathInputValue("annotationPath", matched.annotation_path || "");
+    setPathInputValue("objPath", matched.obj_p_path || "");
     updateLoadButtons();
   }
 }
@@ -695,14 +888,14 @@ function selectSample(annotationPath) {
   appState.selectedSample = appState.allSamples.find((item) => item.annotation_path === annotationPath) || null;
   if (!appState.selectedSample) return;
   $("sampleSelect").value = annotationPath;
-  $("annotationPath").value = appState.selectedSample.annotation_path || "";
-  $("objPath").value = appState.selectedSample.obj_p_path || "";
-  if ($("adminRatingText")) $("adminRatingText").value = appState.selectedSample.admin_rating_label || ratingLabels[appState.selectedSample.admin_rating] || "";
-  if ($("reviewStatusText")) $("reviewStatusText").value = appState.selectedSample.review_status_label || "";
+  setPathInputValue("annotationPath", appState.selectedSample.annotation_path || "");
+  setPathInputValue("objPath", appState.selectedSample.obj_p_path || "");
+  if ($("adminRatingText")) $("adminRatingText").value = appState.selectedSample.admin_rating_label || reviewRatingLabels[appState.selectedSample.admin_rating] || "";
+  setReviewStatusText(statusLabelForSample(appState.selectedSample));
   if ($("adminRemarkText")) $("adminRemarkText").value = "";
-  const currentOutput = $("outputRoot").value.trim();
+  const currentOutput = pathInputValue("outputRoot");
   if (!currentOutput) {
-    $("outputRoot").value = appState.data?.output_root || "";
+    setPathInputValue("outputRoot", appState.data?.output_root || "");
   }
   $("sampleTitle").textContent = appState.selectedSample.display_name || appState.selectedSample.name;
   updateLoadButtons();
@@ -804,56 +997,38 @@ function movementCandidates(viewCamera, baseWorld, step, width, height) {
   return result;
 }
 
-function renderSideCompass(node, candidates, positiveAxes, step) {
+function renderSideCompass(node, candidates, positiveAxes) {
   const visibleCandidates = candidates.filter((item) => item.length >= minVisibleMove);
   const visiblePositiveAxes = positiveAxes.filter((item) => item.length >= minVisibleMove);
   if (!visibleCandidates.length || !visiblePositiveAxes.length) {
-    node.innerHTML = `<div class="legend-title">步长 ${step}</div><div class="legend-text">该视角下移动趋势太小。</div>`;
+    node.innerHTML = "";
     return;
   }
 
-  const right = bestMove(visibleCandidates, "right");
-  const left = bestMove(visibleCandidates, "left");
-  const up = bestMove(visibleCandidates, "up");
-  const down = bestMove(visibleCandidates, "down");
   const centerX = 54;
-  const centerY = 46;
+  const centerY = 54;
   const compass = visiblePositiveAxes
     .map((item, index) => {
       const color = axisColors[item.label] || "#222";
       const length = Math.max(item.length, 0.001);
-      const displayLength = 22 + index * 2;
+      const displayLength = 38 + index * 3;
       const unitX = item.dx / length;
       const unitY = item.dy / length;
       const x2 = centerX + unitX * displayLength;
       const y2 = centerY + unitY * displayLength;
-      const textX = Math.min(Math.max(x2 + unitX * 7 - 10, 2), 86);
-      const textY = Math.min(Math.max(y2 + unitY * 7 + 4, 12), 88);
-      return `<line x1="${centerX}" y1="${centerY}" x2="${x2}" y2="${y2}" stroke="${color}" stroke-width="2" stroke-linecap="round" />
-              <circle cx="${x2}" cy="${y2}" r="2.4" fill="${color}" />
-              <text x="${textX}" y="${textY}" fill="${color}" font-size="12" font-weight="900">${item.label}</text>`;
-    })
-    .join("");
-
-  const scaleLines = visiblePositiveAxes
-    .map((item) => {
-      const color = axisColors[item.label] || "#222";
-      const y = item.label === "+x" ? 16 : item.label === "+y" ? 38 : 60;
-      const len = Math.min(76, Math.max(5, item.length));
-      return `<line x1="16" y1="${y}" x2="${16 + len}" y2="${y}" stroke="${color}" stroke-width="4" stroke-linecap="round" />
-              <text x="16" y="${y - 7}" fill="${color}" font-size="11" font-weight="900">${item.label}</text>`;
+      const textX = Math.min(Math.max(x2 + unitX * 8 - 12, 2), 89);
+      const textY = Math.min(Math.max(y2 + unitY * 8 + 5, 14), 104);
+      return `<line x1="${centerX}" y1="${centerY}" x2="${x2}" y2="${y2}" stroke="${color}" stroke-width="3" stroke-linecap="round" />
+              <circle cx="${x2}" cy="${y2}" r="3.4" fill="${color}" />
+              <text x="${textX}" y="${textY}" fill="${color}" font-size="14" font-weight="900">${item.label}</text>`;
     })
     .join("");
 
   node.innerHTML = `
-    <div class="legend-title">步长 ${step}</div>
-    <svg class="legend-compass" viewBox="0 0 108 92">
+    <svg class="legend-compass" viewBox="0 0 108 108">
       <circle cx="${centerX}" cy="${centerY}" r="3" fill="#111" />
       ${compass}
     </svg>
-    <div class="legend-title small">线段长度表示一步在图中的位移</div>
-    <svg class="legend-scale" viewBox="0 0 108 72">${scaleLines}</svg>
-    <div class="legend-text">向右: ${right.label}<br />向左: ${left.label}<br />向上: ${up.label}<br />向下: ${down.label}</div>
   `;
 }
 
@@ -915,7 +1090,7 @@ function movedTargetOverlayMarkup(entry, viewCamera, width, height, options = {}
 
 function renderSelectionMarker(svg, viewCamera, targetWorld, width, height, group) {
   svg.setAttribute("viewBox", `0 0 ${width} ${height}`);
-  svg.setAttribute("preserveAspectRatio", "none");
+  svg.setAttribute("preserveAspectRatio", "xMidYMid meet");
   const point = projectWorldToPixels(targetWorld, viewCamera, width, height);
   if (!point) {
     svg.innerHTML = movedTargetEntries()
@@ -1005,7 +1180,7 @@ function renderViewGuides() {
       svg.innerHTML = "";
       continue;
     }
-    renderSideCompass(node, candidates, candidates.filter((item) => item.label.startsWith("+")), step);
+    renderSideCompass(node, candidates, candidates.filter((item) => item.label.startsWith("+")));
     renderSelectionMarker(svg, camera, baseWorld, width, height, group);
   }
 }
@@ -1015,7 +1190,7 @@ function renderState(data, options = {}) {
   if (options.resetHistory) resetPositionHistory();
   if (!data.loaded) {
     if ($("adminRatingText")) $("adminRatingText").value = "";
-    if ($("reviewStatusText")) $("reviewStatusText").value = "";
+    setReviewStatusText("待微调");
     if ($("adminRemarkText")) $("adminRemarkText").value = "";
     refreshObjOPreview(data, Boolean(options.forceObjPreview));
     renderExistingOutputNotice(data);
@@ -1026,7 +1201,7 @@ function renderState(data, options = {}) {
   }
   captureTargetBaselines(data);
 
-  $("datasetRoot").value = data.dataset_root || $("datasetRoot").value;
+  setPathInputValue("datasetRoot", data.dataset_root || pathInputValue("datasetRoot"));
   if (data.annotation_path && $("sampleSelect")) {
     const matched = appState.allSamples.find((item) => item.annotation_path === data.annotation_path);
     if (matched) {
@@ -1043,16 +1218,16 @@ function renderState(data, options = {}) {
       if (sampleMatchesStatusFilter(matched)) $("sampleSelect").value = data.annotation_path;
     }
   }
-  const stateOutput = data.output_root || $("outputRoot").value || data.dataset_root || "";
-  $("outputRoot").value = stateOutput;
+  const stateOutput = data.output_root || pathInputValue("outputRoot") || data.dataset_root || "";
+  setPathInputValue("outputRoot", stateOutput);
   if (data.editor_name && $("editorName")) $("editorName").value = data.editor_name;
   if ($("selfRating")) $("selfRating").value = data.self_rating || "";
   if ($("adjusterRemark")) $("adjusterRemark").value = data.adjuster_remark || "";
-  if ($("adminRatingText")) $("adminRatingText").value = data.admin_rating_label || ratingLabels[data.admin_rating] || "";
-  if ($("reviewStatusText")) $("reviewStatusText").value = data.review_status_label || "";
+  if ($("adminRatingText")) $("adminRatingText").value = data.admin_rating_label || reviewRatingLabels[data.admin_rating] || "";
+  setReviewStatusText(data.review_status_label || sampleStatusLabels[data.review_status || ""] || "待微调");
   if ($("adminRemarkText")) $("adminRemarkText").value = data.admin_remark || "";
-  $("annotationPath").value = data.annotation_path || "";
-  $("objPath").value = data.obj_p_path || "";
+  setPathInputValue("annotationPath", data.annotation_path || "");
+  setPathInputValue("objPath", data.obj_p_path || "");
   $("sampleTitle").textContent = data.annotation_path?.split(/[\\/]/).slice(-3).join(" / ") || "已加载";
   renderCamera(data.camera);
   renderTargetSelector();
@@ -1168,8 +1343,8 @@ async function loadAnnotation(options = {}) {
     const data = await postJson("/api/load", {
       annotation_json: appState.selectedSample.annotation_path,
       obj_p_path: appState.selectedSample.obj_p_path || null,
-      dataset_root: $("datasetRoot").value.trim(),
-      output_root: $("outputRoot").value.trim(),
+      dataset_root: pathInputValue("datasetRoot"),
+      output_root: pathInputValue("outputRoot"),
       start_from_output: startFromOutput,
     });
     appState.selectedIndex = 0;
@@ -1207,7 +1382,8 @@ async function renderProjection(endpoint = "/api/render") {
     renderState(data, { forceObjPreview: true });
     if (isSave) await refreshSamplesPreservingCurrent(data.annotation_path);
     finishStageToast(isSave ? "完整结果保存完成" : "投影生成完成");
-    setStatus(isSave ? `已保存完整结果：${data.manual_output_info?.layout_dir || data.adjusted_json_path}` : "预览投影已生成，JSON 未写入。");
+    const savedPath = data.manual_output_info?.layout_dir || data.adjusted_json_path || "";
+    setStatus(isSave ? `已保存完整结果：${shortenMiddle(savedPath, 72)}` : "预览投影已生成，JSON 未写入。");
   } catch (error) {
     finishStageToast(error.message || String(error), true);
     setStatus(error.message || String(error), true);
@@ -1217,7 +1393,7 @@ async function renderProjection(endpoint = "/api/render") {
 async function downloadExportZip() {
   try {
     if (!requireEditorName("导出 ZIP")) return;
-    const outputRoot = $("outputRoot").value.trim();
+    const outputRoot = pathInputValue("outputRoot");
     if (!outputRoot) {
       setStatus("请先填写输出根目录。", true);
       return;
@@ -1237,7 +1413,7 @@ async function downloadExportZip() {
     }
     const result = JSON.parse(text);
     finishStageToast("ZIP 已导出到本地");
-    setStatus(`已导出 ZIP：${result.path}`);
+    setStatus(`已导出 ZIP：${shortenMiddle(result.path, 72)}`);
     window.alert(`导出成功，文件已保存到：\n${result.path}`);
   } catch (error) {
     finishStageToast(error.message || String(error), true);
@@ -1281,6 +1457,9 @@ function nudge(axis, delta) {
 }
 
 function initEvents() {
+  document.addEventListener("keydown", (event) => {
+    if (event.key === "Escape" && !$("mediaModal")?.hidden) closeMediaModal();
+  });
   $("refreshSamples").addEventListener("click", () => refreshSamples({ autoLoad: true }));
   $("sampleStatusFilter")?.addEventListener("change", async () => {
     const preferred = appState.selectedSample?.annotation_path || appState.data?.annotation_path || "";
@@ -1291,8 +1470,8 @@ function initEvents() {
     } else {
       appState.selectedSample = null;
       $("sampleTitle").textContent = "当前筛选无样本";
-      $("annotationPath").value = "";
-      $("objPath").value = "";
+      setPathInputValue("annotationPath", "");
+      setPathInputValue("objPath", "");
       setStatus("当前状态筛选下没有样本。", true);
     }
   });
@@ -1349,7 +1528,7 @@ function initEvents() {
     updateSaveButtons(appState.data);
   });
   $("adjusterRemark")?.addEventListener("input", () => markDirty(false));
-  for (const button of document.querySelectorAll(".move-toolbar button[data-axis]")) {
+  for (const button of document.querySelectorAll(".axis-step[data-axis]")) {
     button.addEventListener("click", () => nudge(Number(button.dataset.axis), Number(button.dataset.delta)));
   }
   for (const id of sliderIds) {
@@ -1372,11 +1551,13 @@ function initEvents() {
 
 async function init() {
   placeActionButtons();
+  bindPathInputs();
+  addFullscreenButtons();
   initEvents();
   try {
     const defaults = await getJson("/api/defaults");
-    $("datasetRoot").value = defaults.dataset_root || "";
-    $("outputRoot").value = defaults.output_root || defaults.dataset_root || "";
+    setPathInputValue("datasetRoot", defaults.dataset_root || "");
+    setPathInputValue("outputRoot", defaults.output_root || defaults.dataset_root || "");
     await refreshSamples();
     if (appState.selectedSample) {
       await loadAnnotation();
