@@ -21,6 +21,7 @@ const appState = {
   historyRestoring: false,
   historyLimit: 80,
   sampleStatusFilter: "all",
+  sampleRatingFilter: "all",
 };
 
 const viewIds = { main: "imgMain", up: "imgUp", down: "imgDown", left: "imgLeft", right: "imgRight" };
@@ -230,11 +231,26 @@ function statusFilterValue() {
   return $("sampleStatusFilter")?.value || appState.sampleStatusFilter || "all";
 }
 
+function ratingFilterValue() {
+  return $("sampleRatingFilter")?.value || appState.sampleRatingFilter || "all";
+}
+
 function sampleMatchesStatusFilter(sample, filter = statusFilterValue()) {
   const status = sample?.review_status || "";
   if (filter === "all") return true;
   if (filter === "none") return !status;
   return status === filter;
+}
+
+function sampleMatchesRatingFilter(sample, filter = ratingFilterValue()) {
+  const rating = sample?.self_rating || "";
+  if (filter === "all") return true;
+  if (filter === "none") return !rating;
+  return rating === filter;
+}
+
+function sampleMatchesFilters(sample) {
+  return sampleMatchesStatusFilter(sample, appState.sampleStatusFilter) && sampleMatchesRatingFilter(sample, appState.sampleRatingFilter);
 }
 
 function statusLabelForSample(sample) {
@@ -253,7 +269,8 @@ function renderSampleOptions(preferredAnnotationPath = "") {
   const sampleSelect = $("sampleSelect");
   if (!sampleSelect) return null;
   appState.sampleStatusFilter = statusFilterValue();
-  appState.samples = appState.allSamples.filter((sample) => sampleMatchesStatusFilter(sample, appState.sampleStatusFilter));
+  appState.sampleRatingFilter = ratingFilterValue();
+  appState.samples = appState.allSamples.filter((sample) => sampleMatchesFilters(sample));
   sampleSelect.innerHTML = "";
   for (const sample of appState.samples) {
     const option = document.createElement("option");
@@ -859,7 +876,7 @@ async function refreshSamples(options = {}) {
       appState.selectedSample = null;
       $("sampleTitle").textContent = "未找到样本";
       const hasAnySamples = appState.allSamples.length > 0;
-      setStatus(hasAnySamples ? "当前状态筛选下没有样本。" : "输入根目录下没有找到 Annotation JSON。", true);
+      setStatus(hasAnySamples ? "当前筛选条件下没有样本。" : "输入根目录下没有找到 Annotation JSON。", true);
       finishStageToast(hasAnySamples ? "当前筛选无样本" : "没有找到可加载的样本", true);
     }
   } catch (error) {
@@ -877,7 +894,7 @@ async function refreshSamplesPreservingCurrent(preferredAnnotationPath) {
   const matched = appState.allSamples.find((item) => item.annotation_path === preferredAnnotationPath);
   if (matched) {
     appState.selectedSample = matched;
-    if (sampleMatchesStatusFilter(matched) && $("sampleSelect")) $("sampleSelect").value = matched.annotation_path;
+    if (sampleMatchesStatusFilter(matched) && sampleMatchesRatingFilter(matched) && $("sampleSelect")) $("sampleSelect").value = matched.annotation_path;
     setPathInputValue("annotationPath", matched.annotation_path || "");
     setPathInputValue("objPath", matched.obj_p_path || "");
     updateLoadButtons();
@@ -1215,7 +1232,7 @@ function renderState(data, options = {}) {
       matched.admin_rating_label = data.admin_rating_label || "";
       appState.selectedSample = matched;
       renderSampleOptions(data.annotation_path);
-      if (sampleMatchesStatusFilter(matched)) $("sampleSelect").value = data.annotation_path;
+      if (sampleMatchesStatusFilter(matched) && sampleMatchesRatingFilter(matched)) $("sampleSelect").value = data.annotation_path;
     }
   }
   const stateOutput = data.output_root || pathInputValue("outputRoot") || data.dataset_root || "";
@@ -1456,25 +1473,28 @@ function nudge(axis, delta) {
   scheduleAnchorSnap();
 }
 
+async function applySampleFilters() {
+  const preferred = appState.selectedSample?.annotation_path || appState.data?.annotation_path || "";
+  const selected = renderSampleOptions(preferred);
+  if (selected) {
+    selectSample(selected.annotation_path);
+    await loadAnnotation();
+  } else {
+    appState.selectedSample = null;
+    $("sampleTitle").textContent = "当前筛选无样本";
+    setPathInputValue("annotationPath", "");
+    setPathInputValue("objPath", "");
+    setStatus("当前筛选条件下没有样本。", true);
+  }
+}
+
 function initEvents() {
   document.addEventListener("keydown", (event) => {
     if (event.key === "Escape" && !$("mediaModal")?.hidden) closeMediaModal();
   });
   $("refreshSamples").addEventListener("click", () => refreshSamples({ autoLoad: true }));
-  $("sampleStatusFilter")?.addEventListener("change", async () => {
-    const preferred = appState.selectedSample?.annotation_path || appState.data?.annotation_path || "";
-    const selected = renderSampleOptions(preferred);
-    if (selected) {
-      selectSample(selected.annotation_path);
-      await loadAnnotation();
-    } else {
-      appState.selectedSample = null;
-      $("sampleTitle").textContent = "当前筛选无样本";
-      setPathInputValue("annotationPath", "");
-      setPathInputValue("objPath", "");
-      setStatus("当前状态筛选下没有样本。", true);
-    }
-  });
+  $("sampleStatusFilter")?.addEventListener("change", applySampleFilters);
+  $("sampleRatingFilter")?.addEventListener("change", applySampleFilters);
   $("sampleSelect").addEventListener("change", async (event) => {
     selectSample(event.target.value);
     await loadAnnotation();

@@ -28,15 +28,27 @@
         <label>样本
           <select id="sampleSelect"></select>
         </label>
-        <label>状态筛选
-          <select id="sampleStatusFilter">
-            <option value="all">全部样本</option>
-            <option value="none">待微调</option>
-            <option value="adjusted">已微调待审核</option>
-            <option value="changes_required">已审核待修改</option>
-            <option value="reviewed">已审核为优</option>
-          </select>
-        </label>
+        <div class="sample-filter-row">
+          <label>状态筛选
+            <select id="sampleStatusFilter">
+              <option value="all">全部样本</option>
+              <option value="none">待微调</option>
+              <option value="adjusted">已微调待审核</option>
+              <option value="changes_required">已审核待修改</option>
+              <option value="reviewed">已审核为优</option>
+            </select>
+          </label>
+          <label>按自评筛选
+            <select id="sampleRatingFilter">
+              <option value="all">全部自评</option>
+              <option value="good">好</option>
+              <option value="medium">中</option>
+              <option value="bad">差</option>
+              <option value="unknown">未知</option>
+              <option value="none">未自评</option>
+            </select>
+          </label>
+        </div>
         <div class="data-actions">
           <button id="exportZipBtn" class="secondary" type="button">导出全部 ZIP</button>
           <button id="importReviewBtn" class="secondary" type="button">导入审核文件</button>
@@ -59,7 +71,7 @@
         </div>
 
         <label class="step-control">主视角移动步长
-          <input id="stepSize" type="number" step="0.01" value="0.05" />
+          <input id="stepSize" type="number" step="0.01" value="0.15" />
         </label>
         <h3>主视角观察坐标</h3>
         <div class="grid3">
