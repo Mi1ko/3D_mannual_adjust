@@ -5,7 +5,6 @@ const adminState = {
   index: 0,
   objView: "main",
   statusFilter: "all",
-  reviewMode: "review",
 };
 
 const selfRatingLabels = { good: "好", medium: "中", bad: "差", unknown: "未知" };
@@ -92,10 +91,6 @@ function selectedSubmission() {
 
 function selectedStatusFilter() {
   return $("adminStatusFilter")?.value || adminState.statusFilter || "all";
-}
-
-function selectedReviewMode() {
-  return $("adminReviewMode")?.value || adminState.reviewMode || "review";
 }
 
 function statusLabelForSample(sample) {
@@ -249,12 +244,10 @@ async function loadSubmissions(options = {}) {
 async function loadSample(index = adminState.index, key = "") {
   adminState.submission = selectedSubmission();
   adminState.statusFilter = selectedStatusFilter();
-  adminState.reviewMode = selectedReviewMode();
   const params = new URLSearchParams({
     submission: adminState.submission,
     index: String(index),
     status_filter: adminState.statusFilter,
-    review_mode: adminState.reviewMode,
   });
   if (key) params.set("key", key);
   const data = await getJson(`/api/admin/sample?${params.toString()}`);
@@ -271,7 +264,7 @@ function renderEmpty() {
   const hint = $("adminReviewedHint");
   if (hint) {
     hint.hidden = true;
-    hint.textContent = "无需再次审核";
+    hint.textContent = "";
   }
   renderSampleJump(null);
   $("adjusterName").textContent = "-";
@@ -301,7 +294,7 @@ function renderImages(sample) {
 function renderSampleJump(data, currentKey = "") {
   const select = $("adminSampleSelect");
   if (!select) return;
-  const samples = Array.isArray(data?.samples) ? data.samples : [];
+  const samples = Array.isArray(data?.all_samples) ? data.all_samples : Array.isArray(data?.samples) ? data.samples : [];
   select.innerHTML = "";
   select.disabled = !samples.length;
   for (const [index, sample] of samples.entries()) {
@@ -392,7 +385,7 @@ function renderAdminState() {
     if (data) {
       const overallTotal = data.overall_total ?? data.total ?? 0;
       $("progressText").textContent = `已审查 ${data.reviewed_count || 0} / ${overallTotal}`;
-      setStatus(data.review_mode === "review" ? "审核模式下没有需要审核的样本。" : "当前状态筛选下没有样本。", true);
+      setStatus("当前状态筛选下没有样本，可通过样本状态切换到全部样本。", true);
     }
     return;
   }
@@ -406,7 +399,7 @@ function renderAdminState() {
   const hint = $("adminReviewedHint");
   if (hint) {
     hint.hidden = Boolean(sample.needs_review);
-    hint.textContent = sample.needs_review ? "无需再次审核" : `${statusLabel}，无需再次审核`;
+    hint.textContent = sample.needs_review ? "" : `${statusLabel}，可重新保存审核`;
   }
   $("adjusterName").textContent = sample.adjuster?.name || sample.adjuster_name || "-";
   $("selfRatingText").textContent = sample.adjuster?.rating_label || selfRatingLabels[sample.self_rating] || "-";
@@ -414,8 +407,8 @@ function renderAdminState() {
   $("selfRemarkText").textContent = sample.adjuster?.remark || "无";
   $("adminRating").value = sample.review?.rating || "";
   $("adminRemark").value = sample.review?.remark || "";
-  $("saveReviewBtn").disabled = !sample.needs_review;
-  $("saveReviewBtn").title = sample.needs_review ? "保存审核信息" : `${statusLabel}，无需再次审核`;
+  $("saveReviewBtn").disabled = false;
+  $("saveReviewBtn").title = sample.needs_review ? "保存审核信息" : `${statusLabel}，可重新保存审核`;
   $("prevSampleBtn").disabled = (data.index || 0) <= 0;
   $("nextSampleBtn").disabled = (data.index || 0) >= (data.total || 1) - 1;
   renderSampleJump(data, sample.key);
@@ -423,16 +416,12 @@ function renderAdminState() {
   renderValidation(sample);
   renderHistory(sample);
   refreshObjPreview();
-  setStatus(sample.needs_review ? "待审核" : `${statusLabel}，无需再次审核`);
+  setStatus(sample.needs_review ? "待审核" : `${statusLabel}，可重新保存审核`);
 }
 
 async function saveReview() {
   const sample = currentSample();
   if (!sample) return;
-  if (!sample.needs_review) {
-    setStatus(`${statusLabelForSample(sample)}，无需再次审核。`, true);
-    return;
-  }
   const rating = $("adminRating").value;
   if (!rating) {
     $("adminRating").focus();
@@ -442,22 +431,18 @@ async function saveReview() {
   try {
     setStatus("正在保存审核...");
     const submission = selectedSubmission();
-    const statusFilter = selectedStatusFilter();
-    const reviewMode = selectedReviewMode();
-    const previousIndex = adminState.index || 0;
     await postJson("/api/admin/review", {
       submission,
       sample_key: sample.key,
       reviewer_name: $("reviewerName").value.trim(),
       admin_rating: rating,
       admin_remark: $("adminRemark").value.trim(),
-      status_filter: statusFilter,
-      review_mode: reviewMode,
+      status_filter: "all",
+      review_mode: "view",
     });
     await loadSubmissions({ autoload: false, preferredSubmission: submission });
-    const nextIndex = reviewMode === "review" || statusFilter !== "all" ? previousIndex : previousIndex + 1;
-    await loadSample(nextIndex);
-    setStatus("审核已保存，已跳到下一个样本。");
+    await loadSample(0, sample.key);
+    setStatus("审核已保存，仍停留在当前样本。");
   } catch (error) {
     setStatus(error.message || String(error), true);
   }
@@ -485,10 +470,6 @@ function initEvents() {
   });
   $("adminStatusFilter").addEventListener("change", async (event) => {
     adminState.statusFilter = event.target.value;
-    await loadSample(0);
-  });
-  $("adminReviewMode").addEventListener("change", async (event) => {
-    adminState.reviewMode = event.target.value;
     await loadSample(0);
   });
   $("prevSampleBtn").addEventListener("click", () => loadSample(Math.max(0, adminState.index - 1)));

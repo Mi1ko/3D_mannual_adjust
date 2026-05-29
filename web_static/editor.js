@@ -846,6 +846,7 @@ function payloadFromState(options = {}) {
   syncSelectedFromInputs();
   if (options.commitHistory) commitPositionHistory();
   return {
+    annotation_path: appState.data?.annotation_path || "",
     editor_name: editorNameValue(),
     output: outputPayload(),
     metadata: metadataPayload(),

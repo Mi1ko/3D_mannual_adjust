@@ -439,6 +439,12 @@ def needs_admin_review(record: dict | None) -> bool:
     return canonical_record_status(record) in ADJUSTED_STATUSES
 
 
+def visible_in_admin_review_mode(record: dict | None) -> bool:
+    if not record:
+        return True
+    return canonical_record_status(record) in ADJUSTED_STATUSES | {"changes_required"}
+
+
 def validation_issue(level: str, title: str, detail: str = "", path: Path | str | None = None) -> dict:
     return {
         "level": level,
@@ -532,6 +538,119 @@ def point_in_bbox(point: list, bounds: dict, margin: float = 0.0) -> bool:
         float(bounds["min"][index]) - margin <= float(point[index]) <= float(bounds["max"][index]) + margin
         for index in range(3)
     )
+
+
+def path_layout_identity(value: object) -> tuple[str, str, str] | None:
+    parts = [part for part in re.split(r"[\\/]+", str(value or "")) if part]
+    lowered = [part.lower() for part in parts]
+    try:
+        index = lowered.index("layout")
+    except ValueError:
+        return None
+    if index + 3 >= len(parts):
+        return None
+    return parts[index + 1], parts[index + 2], parts[index + 3]
+
+
+def validate_annotation_path_identity(annotation_path: Path, annotation: dict, context: str = "Annotation") -> tuple[str, str]:
+    category, sample_name = annotation_identity(annotation_path, annotation)
+    identity = path_layout_identity(annotation_path)
+    if identity is not None:
+        path_category, path_sample, path_level = identity
+        if category != path_category or sample_name != path_sample:
+            raise ValueError(
+                f"{context} 身份不一致：路径为 {path_category}/{path_sample}/{path_level}，"
+                f"JSON 内容为 {category}/{sample_name}。请重新选择正确样本。"
+            )
+    return category, sample_name
+
+
+def validate_obj_p_path_identity(obj_p_path: Path, category: str, sample_name: str) -> None:
+    parts = [part for part in obj_p_path.parts if part]
+    upper_parts = [part.upper() for part in parts]
+    if "OBJ-P" not in upper_parts:
+        return
+    index = upper_parts.index("OBJ-P")
+    if index + 2 >= len(parts):
+        return
+    path_category = parts[index + 1]
+    path_sample = parts[index + 2]
+    expected_name = f"{sample_name}-P"
+    if path_category != category or path_sample != sample_name or obj_p_path.stem != expected_name:
+        raise ValueError(
+            f"Obj-P 路径与当前样本不一致：路径为 {path_category}/{path_sample}/{obj_p_path.name}，"
+            f"当前样本为 {category}/{sample_name}。"
+        )
+
+
+def validate_payload_annotation_path(payload: dict) -> None:
+    raw_path = payload.get("annotation_path")
+    if not raw_path:
+        return
+    with STATE_LOCK:
+        current_path = STATE.get("annotation_path")
+    if current_path is None:
+        return
+    payload_path = Path(raw_path).expanduser().resolve()
+    if payload_path != Path(current_path).expanduser().resolve():
+        raise ValueError(
+            "当前页面样本与服务端加载样本不一致，请重新加载当前样本后再保存。"
+        )
+
+
+def parse_mtl_material_names(path: Path) -> set[str]:
+    materials: set[str] = set()
+    with Path(path).open("r", encoding="utf-8", errors="ignore") as handle:
+        for raw_line in handle:
+            line = raw_line.strip()
+            if line.startswith("newmtl "):
+                name = line.split(None, 1)[1].strip()
+                if name:
+                    materials.add(name)
+    return materials
+
+
+def parse_obj_material_usage(path: Path) -> dict:
+    mtllibs: list[str] = []
+    objects: list[str] = []
+    groups: set[str] = set()
+    group_materials: dict[str, set[str]] = {}
+    used_materials: set[str] = set()
+    current_group = "object"
+    current_material = ""
+    with Path(path).open("r", encoding="utf-8", errors="ignore") as handle:
+        for raw_line in handle:
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if line.startswith("mtllib "):
+                mtllibs.extend(part for part in line.split()[1:] if part)
+                continue
+            if line.startswith("o "):
+                name = line[2:].strip()
+                if name:
+                    objects.append(name)
+                continue
+            if line.startswith("g "):
+                current_group = line[2:].strip() or "object"
+                groups.add(current_group)
+                continue
+            if line.startswith("usemtl "):
+                current_material = line.split(None, 1)[1].strip()
+                if current_material:
+                    used_materials.add(current_material)
+                continue
+            if line.startswith("f "):
+                groups.add(current_group)
+                if current_material:
+                    group_materials.setdefault(current_group, set()).add(current_material)
+    return {
+        "mtllibs": mtllibs,
+        "objects": objects,
+        "groups": groups,
+        "group_materials": group_materials,
+        "used_materials": used_materials,
+    }
 
 
 def choose_points_file(points_dir: Path) -> Path | None:
@@ -668,6 +787,89 @@ def validate_admin_layout_json(layout_json: dict, reference_json: dict | None, c
             issues.append(validation_issue("warning", "Layout hierarchy_file 与 3DLPD layout2 不一致", f"当前 {layout_json.get('hierarchy_file')!r}，参考 {reference_json.get('hierarchy_file')!r}"))
 
 
+def validate_admin_record_source(sample: dict, category: str, sample_name: str, issues: list[dict]) -> None:
+    identity = path_layout_identity(sample.get("input_annotation_path"))
+    if identity is None:
+        return
+    source_category, source_sample, source_level = identity
+    if source_category != category or source_sample != sample_name:
+        issues.append(
+            validation_issue(
+                "error",
+                "记录 input_annotation_path 与当前样本不一致",
+                f"路径指向 {source_category}/{source_sample}/{source_level}，当前为 {category}/{sample_name}",
+                sample.get("input_annotation_path"),
+            )
+        )
+
+
+def validate_anchor_points_on_targets(layout_json: dict, reference_obj_p: Path, issues: list[dict]) -> None:
+    for index, group in enumerate(layout_json.get("groups") or []):
+        if not isinstance(group, dict):
+            continue
+        group_id = str(group.get("group_id") or index + 1)
+        point = (group.get("anchor") or {}).get("point")
+        target_g = [str(name) for name in (group.get("target_g") or []) if str(name).strip()]
+        if not is_number_triplet(point) or not target_g:
+            continue
+        try:
+            _, distance, tolerance, triangle_count = closest_point_on_target_groups(np.asarray(point, dtype=float), reference_obj_p, target_g)
+        except Exception as exc:
+            issues.append(validation_issue("error", f"group {group_id} anchor 无法匹配 target_g 几何", str(exc), reference_obj_p))
+            continue
+        if triangle_count <= 0 or distance > tolerance:
+            issues.append(
+                validation_issue(
+                    "warning",
+                    f"group {group_id} anchor.point 未落在 target_g 表面",
+                    f"距离 {distance:.6g}，容差 {tolerance:.6g}，target_g={', '.join(target_g)}",
+                    reference_obj_p,
+                )
+            )
+
+
+def validate_obj_o_material_consistency(layout_json: dict, obj_o_path: Path, mtl_path: Path, sample_name: str, issues: list[dict]) -> None:
+    try:
+        usage = parse_obj_material_usage(obj_o_path)
+    except Exception as exc:
+        issues.append(validation_issue("error", "Obj-O 无法解析材质/组信息", str(exc), obj_o_path))
+        return
+
+    expected_mtl = mtl_path.name
+    if expected_mtl not in usage["mtllibs"]:
+        issues.append(validation_issue("error", "Obj-O mtllib 与样本 MTL 不一致", f"当前引用：{', '.join(usage['mtllibs']) or '无'}，期望：{expected_mtl}", obj_o_path))
+
+    for object_name in usage["objects"]:
+        match = re.fullmatch(r"(.+)-P", object_name)
+        if match and match.group(1) != sample_name:
+            issues.append(validation_issue("error", "Obj-O 来源样本 ID 不一致", f"OBJ 对象名为 {object_name}，当前样本应为 {sample_name}-P", obj_o_path))
+            break
+
+    _, expected_group_materials = build_obj_o_materials(layout_json)
+    target_groups = set(expected_group_materials)
+    missing_groups = sorted(target_groups - usage["groups"])
+    if missing_groups:
+        issues.append(validation_issue("error", "Obj-O 缺少 annotation target_g 对应组", ", ".join(missing_groups[:12]), obj_o_path))
+
+    wrong_materials: list[str] = []
+    for group_name, expected_material in expected_group_materials.items():
+        actual = usage["group_materials"].get(group_name, set())
+        if group_name in usage["groups"] and expected_material not in actual:
+            wrong_materials.append(f"{group_name}: {', '.join(sorted(actual)) or '无'} -> {expected_material}")
+    if wrong_materials:
+        issues.append(validation_issue("error", "Obj-O target_g 材质未正确应用", "；".join(wrong_materials[:8]), obj_o_path))
+
+    if mtl_path.is_file():
+        try:
+            material_names = parse_mtl_material_names(mtl_path)
+        except Exception as exc:
+            issues.append(validation_issue("error", "Obj-O MTL 无法解析", str(exc), mtl_path))
+            return
+        missing_definitions = sorted((usage["used_materials"] | set(expected_group_materials.values())) - material_names)
+        if missing_definitions:
+            issues.append(validation_issue("error", "Obj-O MTL 缺少材质定义", ", ".join(missing_definitions[:12]), mtl_path))
+
+
 def validate_admin_sample(submission_root: Path, key: str, sample: dict, layout_path: Path, obj_o_info: dict) -> dict:
     issues: list[dict] = []
     category = str(sample.get("category") or "")
@@ -675,6 +877,7 @@ def validate_admin_sample(submission_root: Path, key: str, sample: dict, layout_
     expected_key = sample_key(category, sample_name)
     if key != expected_key or sample.get("key") not in {None, "", expected_key}:
         issues.append(validation_issue("error", "记录 key 与 category/sample_id 不匹配", f"记录 key={key!r}，期望 {expected_key!r}"))
+    validate_admin_record_source(sample, category, sample_name, issues)
     expected_relative = Path("Layout") / category / sample_name / OUTPUT_LAYOUT_LEVEL
     expected_layout = (submission_root / expected_relative).resolve()
     if layout_path != expected_layout:
@@ -763,8 +966,11 @@ def validate_admin_sample(submission_root: Path, key: str, sample: dict, layout_
             group_id = str(group.get("group_id") or "")
             if is_number_triplet(point) and not point_in_bbox(point, reference_obj_bounds, margin):
                 issues.append(validation_issue("warning", f"group {group_id} anchor.point 超出 Obj-P 坐标范围", "请确认是否仍然落在物体上"))
+        validate_anchor_points_on_targets(layout_json, reference_obj_p, issues)
 
     main_obj_o = obj_o_dir / f"{sample_name}-main-O.obj"
+    if main_obj_o.is_file() and layout_json:
+        validate_obj_o_material_consistency(layout_json, main_obj_o, mtl_path, sample_name, issues)
     if main_obj_o.is_file() and reference_obj_bounds is not None:
         try:
             obj_o_bounds = obj_vertex_bounds(main_obj_o)
@@ -1849,7 +2055,9 @@ def append_transformed_text_obj(
         return vertex_offset
     transformed = transform_text_vertices(vertices, group, camera)
     group_id = str(group.get("group_id") or group.get("label", {}).get("text") or "label")
-    lines.append(f"o label_{safe_stem(group_id)}")
+    label_name = f"label_{safe_stem(group_id)}"
+    lines.append(f"o {label_name}")
+    lines.append(f"g {label_name}")
     for vertex in transformed:
         lines.append(f"v {vertex[0]:.9f} {vertex[1]:.9f} {vertex[2]:.9f}")
     current_material = None
@@ -1972,7 +2180,9 @@ def append_leader_tubes(lines: list[str], vertex_offset: int, annotation: dict) 
                 continue
             if not object_written:
                 group_id = str(group.get("group_id") or group.get("label", {}).get("text") or "leader")
-                lines.append(f"o leader_{safe_stem(group_id)}")
+                leader_name = f"leader_{safe_stem(group_id)}"
+                lines.append(f"o {leader_name}")
+                lines.append(f"g {leader_name}")
                 lines.append("usemtl leader_line_color")
                 object_written = True
             vertex_offset = append_tube_segment(lines, vertex_offset, start, end, radius)
@@ -2105,6 +2315,7 @@ def load_annotation(
 ) -> dict:
     annotation_path = Path(annotation_json).expanduser().resolve()
     base_annotation = load_json(annotation_path)
+    base_category, base_sample = validate_annotation_path_identity(annotation_path, base_annotation, "Input Annotation")
     resolved_dataset_root = Path(dataset_root).expanduser().resolve() if dataset_root else infer_dataset_root(annotation_path)
     resolved_output_root = Path(output_root).expanduser().resolve() if output_root else DEFAULT_OUTPUT_ROOT
     source_annotation_path = annotation_path
@@ -2115,13 +2326,20 @@ def load_annotation(
             raise FileNotFoundError(f"No adjusted output annotation exists: {candidate}")
         source_annotation_path = candidate.resolve()
         annotation = load_json(source_annotation_path)
+        output_category, output_sample = validate_annotation_path_identity(source_annotation_path, annotation, "Output Annotation")
+        if (output_category, output_sample) != (base_category, base_sample):
+            raise ValueError(
+                f"Output Annotation 与 Input 样本不一致：Input 为 {base_category}/{base_sample}，"
+                f"Output 为 {output_category}/{output_sample}。"
+            )
     normalize_group_ids(annotation)
     apply_internal_camera(annotation)
     annotation.pop("editor_name", None)
     annotation.pop("annotator_name", None)
     resolved_obj_p = Path(obj_p_path).expanduser().resolve() if obj_p_path else infer_obj_p_path(annotation_path, annotation)
     adjusted_json_path = output_json_path(resolved_output_root, annotation_path, annotation)
-    model_cat, sample_name = annotation_identity(annotation_path, annotation)
+    model_cat, sample_name = validate_annotation_path_identity(annotation_path, annotation, "当前 Annotation")
+    validate_obj_p_path_identity(resolved_obj_p, model_cat, sample_name)
     projection_images = resolve_projection_images(
         annotation,
         resolved_dataset_root,
@@ -2160,6 +2378,7 @@ def load_sample(
 
 
 def apply_update(payload: dict) -> dict:
+    validate_payload_annotation_path(payload)
     with STATE_LOCK:
         annotation = STATE["annotation"]
         if annotation is None:
@@ -2716,7 +2935,7 @@ def sample_matches_status_filter(sample: dict | None, status_filter: str | None 
 
 
 def normalize_admin_review_mode(value: str | None) -> str:
-    return "review" if str(value or "").strip().lower() == "review" else "view"
+    return "view"
 
 
 def admin_sample_summaries(
@@ -2726,7 +2945,6 @@ def admin_sample_summaries(
 ) -> list[dict]:
     records = load_admin_effective_records(submission_root)
     samples = records.get("samples") or {}
-    mode = normalize_admin_review_mode(review_mode)
     summaries = []
     for key, sample in sorted(samples.items(), key=record_sort_key):
         if not isinstance(sample, dict):
@@ -2734,8 +2952,6 @@ def admin_sample_summaries(
         if not sample_matches_status_filter(sample, status_filter):
             continue
         needs_review = needs_admin_review(sample)
-        if mode == "review" and not needs_review:
-            continue
         summaries.append(
             {
                 "key": key,
@@ -2765,10 +2981,21 @@ def admin_sample_payload(
     mode = normalize_admin_review_mode(review_mode)
     all_summaries = admin_sample_summaries(submission_root, "all", "view")
     summaries = admin_sample_summaries(submission_root, status_filter, mode)
-    if not summaries:
+    selection_summaries = summaries
+    if sample_key_value:
+        filtered_index = next((cursor for cursor, item in enumerate(summaries) if item["key"] == sample_key_value), None)
+        if filtered_index is not None:
+            index = filtered_index
+        else:
+            all_index = next((cursor for cursor, item in enumerate(all_summaries) if item["key"] == sample_key_value), None)
+            if all_index is not None:
+                selection_summaries = all_summaries
+                index = all_index
+    if not selection_summaries:
         return {
             "submission": str(submission_root),
             "samples": [],
+            "all_samples": all_summaries,
             "current": None,
             "index": 0,
             "total": 0,
@@ -2778,10 +3005,8 @@ def admin_sample_payload(
             "status_filter": str(status_filter or "all"),
             "review_mode": mode,
         }
-    if sample_key_value:
-        index = next((cursor for cursor, item in enumerate(summaries) if item["key"] == sample_key_value), index)
-    index = max(0, min(int(index), len(summaries) - 1))
-    summary = summaries[index]
+    index = max(0, min(int(index), len(selection_summaries) - 1))
+    summary = selection_summaries[index]
     sample = samples.get(summary["key"]) or {}
     category = str(sample.get("category") or "")
     sample_name = str(sample.get("sample_id") or "")
@@ -2832,9 +3057,10 @@ def admin_sample_payload(
             "review_records_path": str(records_path(admin_review_root_for_submission(submission_root))),
         },
         "samples": summaries,
+        "all_samples": all_summaries,
         "current": current,
         "index": index,
-        "total": len(summaries),
+        "total": len(selection_summaries),
         "overall_total": len(all_summaries),
         "reviewed_count": sum(1 for item in all_summaries if item["reviewed"]),
         "pending_count": sum(1 for item in all_summaries if item["needs_review"]),
@@ -2859,8 +3085,6 @@ def save_admin_review(submission_name: str, payload: dict) -> dict:
     now = now_iso()
     cycle = int(sample.get("review_cycle") or 0)
     previous_status = canonical_record_status(sample)
-    if previous_status in REVIEWED_STATUSES:
-        raise ValueError(f"{review_status_label(sample)}，无需再次审核。")
     event = "rechecked" if previous_status == "pending_recheck" or cycle > 0 else "reviewed"
     if event == "rechecked" and cycle <= 0:
         cycle = 1

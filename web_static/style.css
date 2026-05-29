@@ -1168,7 +1168,7 @@ body.admin-page {
 
 .admin-topbar {
   display: grid;
-  grid-template-columns: minmax(180px, 1fr) minmax(160px, 230px) minmax(112px, 150px) minmax(140px, 190px) minmax(140px, 210px) minmax(145px, auto) minmax(120px, auto);
+  grid-template-columns: minmax(180px, 1fr) minmax(160px, 230px) minmax(140px, 190px) minmax(140px, 210px) minmax(145px, auto) minmax(120px, auto);
   align-items: end;
   gap: 10px;
   padding: 12px 16px;

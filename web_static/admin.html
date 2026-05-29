@@ -16,12 +16,6 @@
       <label>提交包
         <select id="submissionSelect"></select>
       </label>
-      <label>展示模式
-        <select id="adminReviewMode">
-          <option value="review">审核模式</option>
-          <option value="view">查看模式</option>
-        </select>
-      </label>
       <label>样本状态
         <select id="adminStatusFilter">
           <option value="all">全部样本</option>
@@ -48,13 +42,13 @@
         <div class="admin-sample-title">
           <span id="sampleCounter">-</span>
           <h2 id="adminSampleTitle">未加载</h2>
-          <em id="adminReviewedHint" hidden>无需再次审核</em>
+          <em id="adminReviewedHint" hidden>可重新保存审核</em>
         </div>
         <div class="sample-state-box admin-state-box">
           <span>样本状态</span>
           <strong id="reviewStatusText">待微调</strong>
         </div>
-        <label class="admin-sample-jump">样本直达
+        <label class="admin-sample-jump">样本直达（全量）
           <select id="adminSampleSelect"></select>
         </label>
         <dl class="admin-meta-list">
