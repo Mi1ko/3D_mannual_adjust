@@ -4,6 +4,14 @@
 
 ## 版本更新日志
 
+### v0.3
+
+本版本重点补齐了微调端自检、生成结果自检和 Obj-O 生成一致性：微调端在首次进入页面、刷新文件列表、保存或导入审核文件后会后台检查 input 样本是否满足微调所需资源，问题样本会在下拉框标记“有问题”，顶部状态栏会显示具体原因；该自检只覆盖微调阶段真正依赖的 Annotation、Obj-P、Text_objs/TEXT_OBJS、Mutiviews 和 Obj-O，不再把 Points 作为 input 必需项。导入审核文件时会校验审核记录字段，保存完整结果后会回读检查 output Annotation、Mutiviews、Obj-O、MTL 和 `manual_adjust_records.json`。Obj-O 生成逻辑同步为标签和连接线同时写入 `o label_xxx`/`g label_xxx`、`o leader_xxx`/`g leader_xxx`，生成后的 output/admin/最终整体检查会拦截缺失 `g` 分组的 Obj-O；旧 input Obj-O 保持兼容，不作为微调端错误。连接线仍在三维中连接锚点和标签中心方向，但生成 Obj-O 时会裁到标签包围盒外表面，五视角投影统一基于生成后的 Obj-O 通过 trimesh/pyrender 渲染。
+
+本版本还增加了排查和审核合并保护：后端会以追加模式写入项目根目录 `manual_adjust_app.log`，前端在“只读相机”下方实时显示最新日志；“数据”标题栏新增 `需修改 x/y`，统计待微调和已审核待修改样本占总样本数的比例。导入审核文件时，合并前的本地 `manual_adjust_records.json` 和导入的审核文件会分别归档到 `data/review_history/<时间戳>/`，最终合并结果仍写入当前输出目录的 `manual_adjust_records.json`。为避免旧状态或误选 JSON 导致 `input_annotation_path` 错写，加载 input Annotation 时会强制要求路径来自 `layout2`，且路径中的类别/样本号必须和 JSON 内容一致；保存记录前也会再次校验 `input_annotation_path`，从 output 继续微调时只读取 output 的 layout1 内容，记录中的 input 路径仍保持为对应的 input/layout2。
+
+审核端新增“原始视图”按钮，可在同一个审核样本内切换查看微调者提交的 layout1 结果和原始 layout2 结果。审核样本来源仍然只来自 `data/admin/pending` 和 `data/admin/review_results`；新增的 `ADMIN_INPUT_ROOT` 只用于配置分配任务根目录，例如 `C:\Users\bacho\Desktop\AMIL\3D_Datasets\task`，程序会按当前样本匹配原始 `Layout/<category>/<sample_id>/layout2`，并显示其中的 Obj-O 和五视角投影图。若找不到对应原始样本，原始视图按钮会禁用并提示原因。
+
 ### v0.2
 
 本版本完善了微调与审核的完整闭环：微调端新增从 `input` / `output` 显式加载、撤销/重做、状态筛选、自评筛选、自评与备注、导入审核文件、本地导出 zip （以后提交的结果均为导出的zip）等功能；审核端新增 `pending` 待审核目录和 `review_results` 审核结果目录，审核结果会实时保存，支持审核模式/查看模式、样本直达、状态提示和审核记录导出。界面方面重做了 3x2 预览布局，可同时查看 OBJ-O 和五个投影视角，并增加放大查看、紧凑路径显示和更清晰的顶部表单。蓝色标签瞄准靶、红色锚点瞄准靶、绿色位移起止点已统一为和投影图一致的等比例缩放逻辑，并在多种分辨率下验证对齐。记录文件升级为 `schema_version: 2`，只保存机器可读字段，不再把中文显示 label 写入 JSON，同时兼容旧版记录和旧审核文件导入。
@@ -154,9 +162,7 @@ data/input/
     ├── Meta.json
     ├── Obj-P/
     │   └── <category>/<sample_id>/<sample_id>-P.obj
-    ├── Points/
-    │   └── <category>/<sample_id>/
-    ├── Text_objs/
+    ├── Text_objs/ 或 TEXT_OBJS/
     │   └── <category>/<sample_id>/
     └── Layout/
         └── <category>/
@@ -185,10 +191,10 @@ data/input/
 - `Annotation` 是微调时读取的布局 JSON。
 - `Mutiviews` 是加载样本时直接显示的已有投影图。
 - `Obj-O` 是输入状态下的三维预览来源。
-- `Text_objs` 用于点击“生成投影”或“保存完整结果”时重新合并 OBJ-O；缺失时无法生成或保存。
-- `Points` 当前网页不直接使用，但建议保留在数据集中。
+- `Text_objs` 或 `TEXT_OBJS` 用于点击“生成投影”或“保存完整结果”时重新合并 OBJ-O；缺失时无法生成或保存。
+- `Points` 不属于微调端 input 必需目录，微调端自检不会检查 Points；Points 只在 admin/最终整体检查或数据集检查脚本中使用。
 
-程序不再兼容旧数字 layout 目录或无类别层目录；旧的 `1`、`2`、`3`、`ANNOTATION`、`OBJ-P`、`TEXT_OBJS` 结构不会被扫描。
+程序不再兼容旧数字 layout 目录或无类别层目录；旧的 `1`、`2`、`3`、`ANNOTATION`、`OBJ-P` 结构不会被扫描。当前类别层级下的 `Text_objs` 和 `TEXT_OBJS` 均可识别。
 
 ## 加载样本
 

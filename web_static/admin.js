@@ -4,6 +4,7 @@ const adminState = {
   data: null,
   index: 0,
   objView: "main",
+  viewSource: "output",
   statusFilter: "all",
 };
 
@@ -269,8 +270,10 @@ function renderEmpty() {
   renderSampleJump(null);
   $("adjusterName").textContent = "-";
   $("selfRatingText").textContent = "-";
+  $("adminInputPath").textContent = "-";
   $("reviewStatusText").textContent = "待微调";
   $("selfRemarkText").textContent = "-";
+  updateViewSwitch(null);
   renderValidation(null);
   $("adminRating").value = "";
   $("adminRemark").value = "";
@@ -281,8 +284,59 @@ function renderEmpty() {
   window.clearObjOPreview?.();
 }
 
+function inputViewAvailable(sample) {
+  return Boolean(sample?.input_view?.available);
+}
+
+function activeViewSource(sample = currentSample()) {
+  if (adminState.viewSource === "input" && inputViewAvailable(sample)) return "input";
+  return "output";
+}
+
+function viewPayloadForSample(sample) {
+  if (activeViewSource(sample) === "input") return sample?.input_view || {};
+  return sample || {};
+}
+
+function updateViewSwitch(sample = currentSample()) {
+  const inputButton = $("adminInputViewBtn");
+  const outputButton = $("adminOutputViewBtn");
+  const inputPath = $("adminInputPath");
+  const source = activeViewSource(sample);
+  const inputView = sample?.input_view || {};
+  if (adminState.viewSource === "input" && source !== "input") adminState.viewSource = "output";
+  if (outputButton) outputButton.classList.toggle("active", source === "output");
+  if (inputButton) {
+    inputButton.classList.toggle("active", source === "input");
+    inputButton.disabled = !inputViewAvailable(sample);
+    inputButton.title = inputView.available
+      ? `原始视图: ${inputView.layout_path || inputView.annotation_path || ""}`
+      : inputView.message || "未找到原始视图";
+  }
+  if (inputPath) {
+    const text = inputView.available ? shortenMiddle(inputView.layout_path || inputView.annotation_path || "", 48) : (inputView.message || "-");
+    inputPath.textContent = text || "-";
+    inputPath.title = inputView.layout_path || inputView.annotation_path || inputView.message || "";
+  }
+}
+
+function setAdminViewSource(source) {
+  adminState.viewSource = source === "input" ? "input" : "output";
+  updateViewSwitch();
+  renderImages(currentSample());
+  refreshObjPreview();
+  const sample = currentSample();
+  if (adminState.viewSource === "input" && !inputViewAvailable(sample)) {
+    setStatus(sample?.input_view?.message || "当前样本没有可用原始视图", true);
+  } else if (sample) {
+    setStatus(adminState.viewSource === "input" ? "正在查看原始视图" : "正在查看提交视图");
+  }
+}
+
 function renderImages(sample) {
-  const images = sample?.projection_images || {};
+  updateViewSwitch(sample);
+  const viewPayload = viewPayloadForSample(sample);
+  const images = viewPayload?.projection_images || {};
   for (const [view, id] of Object.entries(imageIds)) {
     const img = $(id);
     if (!img) continue;
@@ -366,14 +420,17 @@ function refreshObjPreview() {
   if (!sample || !window.loadObjOPreview) return;
   const view = $("adminObjViewSelect")?.value || adminState.objView || "main";
   adminState.objView = view;
+  const source = activeViewSource(sample);
+  const viewPayload = viewPayloadForSample(sample);
+  const objInfo = source === "input" ? viewPayload.obj_o_info || {} : (sample.obj_o_sources || {}).output || {};
   window.loadObjOPreview(
     {
-      obj_o_sources: sample.obj_o_sources || {},
-      obj_o_default_source: "output",
-      camera: sample.camera || null,
-      view_cameras: sample.view_cameras || {},
+      obj_o_sources: { [source]: objInfo },
+      obj_o_default_source: source,
+      camera: viewPayload.camera || sample.camera || null,
+      view_cameras: viewPayload.view_cameras || sample.view_cameras || {},
     },
-    { force: true, source: "output", view },
+    { force: true, source, view },
   );
 }
 
@@ -477,6 +534,8 @@ function initEvents() {
   $("adminSampleSelect").addEventListener("change", (event) => loadSample(adminState.index, event.target.value));
   $("saveReviewBtn").addEventListener("click", saveReview);
   $("exportReviewBtn").addEventListener("click", exportReviewRecords);
+  $("adminOutputViewBtn")?.addEventListener("click", () => setAdminViewSource("output"));
+  $("adminInputViewBtn")?.addEventListener("click", () => setAdminViewSource("input"));
   $("adminObjViewSelect").addEventListener("change", refreshObjPreview);
   $("adminResetObjBtn").addEventListener("click", () => window.resetObjOView?.());
 }

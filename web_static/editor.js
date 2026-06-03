@@ -22,6 +22,10 @@ const appState = {
   historyLimit: 80,
   sampleStatusFilter: "all",
   sampleRatingFilter: "all",
+  inputCheck: null,
+  logTimer: null,
+  logPath: "",
+  lastLogText: "",
 };
 
 const viewIds = { main: "imgMain", up: "imgUp", down: "imgDown", left: "imgLeft", right: "imgRight" };
@@ -224,7 +228,81 @@ function sampleOptionText(sample) {
   const suffixes = [];
   if (sample.review_status_label) suffixes.push(`（${sample.review_status_label}）`);
   if (sample.self_rating === "bad") suffixes.push("（自评差）");
+  if (sampleHasInputProblem(sample)) suffixes.push("（有问题）");
   return `${sample.display_name || sample.name}${suffixes.join("")}`;
+}
+
+function checkIssues(check) {
+  return Array.isArray(check?.issues) ? check.issues : [];
+}
+
+function sampleInputIssues(sample) {
+  if (Array.isArray(sample?.input_issues)) return sample.input_issues;
+  return checkIssues(sample?.input_check);
+}
+
+function problemIssues(issues) {
+  return (issues || []).filter((issue) => issue?.level === "error" || issue?.level === "warning");
+}
+
+function sampleHasInputProblem(sample) {
+  return Boolean(sample?.input_problem) || problemIssues(sampleInputIssues(sample)).length > 0;
+}
+
+function issueLine(issue) {
+  const message = String(issue?.message || issue?.title || issue?.code || "未知问题").trim();
+  const detail = String(issue?.detail || "").trim();
+  const path = String(issue?.path || "").trim();
+  const parts = [message];
+  if (detail && detail !== message) parts.push(detail);
+  if (path) parts.push(shortenMiddle(path, 96));
+  return parts.filter(Boolean).join("：");
+}
+
+function sampleProblemText(sample, limit = 6) {
+  return problemIssues(sampleInputIssues(sample))
+    .slice(0, limit)
+    .map(issueLine)
+    .join("；");
+}
+
+function sampleProblemIsError(sample) {
+  return problemIssues(sampleInputIssues(sample)).some((issue) => issue.level === "error");
+}
+
+function datasetProblemText(check, limit = 6) {
+  if (!check || check.status === "ok") return "";
+  const details = (check.details || []).slice(0, limit).join("；");
+  return details ? `${check.label}：${details}` : check.label || "输入文件自检发现问题";
+}
+
+function operationCheckText(label, check, limit = 5) {
+  const status = check?.summary?.status || "ok";
+  const summaryLabel = check?.summary?.label || "通过";
+  if (status === "ok") return `${label}通过`;
+  const details = problemIssues(checkIssues(check))
+    .slice(0, limit)
+    .map(issueLine)
+    .join("；");
+  const statusText = status === "error" ? "失败" : "有警告";
+  return details ? `${label}${statusText}：${details}` : `${label}${statusText}：${summaryLabel}`;
+}
+
+function setInputCheckStatus() {
+  const sample = appState.selectedSample;
+  if (sampleHasInputProblem(sample)) {
+    const label = sample.display_name || sample.name || "当前样本";
+    const summary = sample.input_check?.summary?.label || "输入文件自检发现问题";
+    const details = sampleProblemText(sample);
+    setStatus(`${label} ${summary}${details ? `：${details}` : ""}`, sampleProblemIsError(sample));
+    return true;
+  }
+  const datasetText = datasetProblemText(appState.inputCheck);
+  if (datasetText) {
+    setStatus(datasetText, appState.inputCheck?.status === "error");
+    return true;
+  }
+  return false;
 }
 
 function statusFilterValue() {
@@ -253,6 +331,20 @@ function sampleMatchesFilters(sample) {
   return sampleMatchesStatusFilter(sample, appState.sampleStatusFilter) && sampleMatchesRatingFilter(sample, appState.sampleRatingFilter);
 }
 
+function sampleNeedsAdjustment(sample) {
+  const status = sample?.review_status || "";
+  return !status || status === "changes_required";
+}
+
+function updateAdjustNeededCount() {
+  const node = $("adjustNeededCount");
+  if (!node) return;
+  const total = appState.allSamples.length;
+  const needed = appState.allSamples.filter(sampleNeedsAdjustment).length;
+  node.textContent = `需修改 ${needed}/${total}`;
+  node.title = `待微调 + 已审核待修改：${needed} / 总数：${total}`;
+}
+
 function statusLabelForSample(sample) {
   return sample?.review_status_label || sampleStatusLabels[sample?.review_status || ""] || "待微调";
 }
@@ -271,11 +363,16 @@ function renderSampleOptions(preferredAnnotationPath = "") {
   appState.sampleStatusFilter = statusFilterValue();
   appState.sampleRatingFilter = ratingFilterValue();
   appState.samples = appState.allSamples.filter((sample) => sampleMatchesFilters(sample));
+  updateAdjustNeededCount();
   sampleSelect.innerHTML = "";
   for (const sample of appState.samples) {
     const option = document.createElement("option");
     option.value = sample.annotation_path;
     option.textContent = sampleOptionText(sample);
+    if (sampleHasInputProblem(sample)) {
+      option.classList.add("problem");
+      option.title = sampleProblemText(sample, 10);
+    }
     sampleSelect.appendChild(option);
   }
   const selected =
@@ -292,6 +389,7 @@ function refreshSampleOption(sample) {
   for (const option of sampleSelect.options) {
     if (option.value === sample.annotation_path) {
       option.textContent = sampleOptionText(sample);
+      option.title = sampleHasInputProblem(sample) ? sampleProblemText(sample, 10) : "";
       return;
     }
   }
@@ -335,6 +433,32 @@ function setStatus(message, isError = false) {
   node.textContent = text;
   node.title = text;
   node.classList.toggle("error", Boolean(isError));
+}
+
+async function refreshBackendLog() {
+  const box = $("backendLogBox");
+  if (!box) return;
+  try {
+    const data = await getJson(`/api/logs?lines=160&t=${Date.now()}`);
+    const lines = Array.isArray(data.lines) ? data.lines : [];
+    const text = lines.join("\n");
+    appState.logPath = data.path || "";
+    box.title = appState.logPath;
+    box.textContent = text || "暂无日志";
+    if (text !== appState.lastLogText) {
+      appState.lastLogText = text;
+      box.scrollTop = box.scrollHeight;
+    }
+  } catch (error) {
+    box.textContent = `日志读取失败：${error.message || String(error)}`;
+    box.title = "";
+  }
+}
+
+function startBackendLogPolling() {
+  window.clearInterval(appState.logTimer);
+  refreshBackendLog();
+  appState.logTimer = window.setInterval(refreshBackendLog, 2000);
 }
 
 function showToast(message, isError = false, duration = 1800) {
@@ -865,6 +989,7 @@ async function refreshSamples(options = {}) {
     const outputRoot = pathInputValue("outputRoot");
     const data = await getJson(`/api/samples?root=${encodeURIComponent(root)}&output_root=${encodeURIComponent(outputRoot)}`);
     appState.allSamples = data.samples || [];
+    appState.inputCheck = data.input_check || null;
     const selected = renderSampleOptions();
     if (appState.samples.length) {
       const firstOpen = appState.samples.find((sample) => sample.review_status !== "reviewed") || selected;
@@ -877,7 +1002,8 @@ async function refreshSamples(options = {}) {
       appState.selectedSample = null;
       $("sampleTitle").textContent = "未找到样本";
       const hasAnySamples = appState.allSamples.length > 0;
-      setStatus(hasAnySamples ? "当前筛选条件下没有样本。" : "输入根目录下没有找到 Annotation JSON。", true);
+      const checkText = datasetProblemText(appState.inputCheck);
+      setStatus(checkText || (hasAnySamples ? "当前筛选条件下没有样本。" : "输入根目录下没有找到 Annotation JSON。"), true);
       finishStageToast(hasAnySamples ? "当前筛选无样本" : "没有找到可加载的样本", true);
     }
   } catch (error) {
@@ -891,6 +1017,7 @@ async function refreshSamplesPreservingCurrent(preferredAnnotationPath) {
   const outputRoot = pathInputValue("outputRoot");
   const data = await getJson(`/api/samples?root=${encodeURIComponent(root)}&output_root=${encodeURIComponent(outputRoot)}`);
   appState.allSamples = data.samples || [];
+  appState.inputCheck = data.input_check || null;
   renderSampleOptions(preferredAnnotationPath);
   const matched = appState.allSamples.find((item) => item.annotation_path === preferredAnnotationPath);
   if (matched) {
@@ -917,7 +1044,9 @@ function selectSample(annotationPath) {
   }
   $("sampleTitle").textContent = appState.selectedSample.display_name || appState.selectedSample.name;
   updateLoadButtons();
-  setStatus("已选择样本，可以从 input 加载；如已有微调结果，也可以从 output 加载。");
+  if (!setInputCheckStatus()) {
+    setStatus("已选择样本，可以从 input 加载；如已有微调结果，也可以从 output 加载。");
+  }
 }
 
 function renderCamera(camera) {
@@ -1214,7 +1343,9 @@ function renderState(data, options = {}) {
     renderExistingOutputNotice(data);
     updateLoadButtons();
     updateSaveButtons(data);
-    setStatus("还没有加载 JSON。", true);
+    if (!setInputCheckStatus()) {
+      setStatus("还没有加载 JSON。", true);
+    }
     return;
   }
   captureTargetBaselines(data);
@@ -1257,7 +1388,9 @@ function renderState(data, options = {}) {
   updateSaveButtons(data);
   refreshObjOPreview(data, Boolean(options.forceObjPreview));
   appState.dirty = false;
-  setStatus("已加载。移动会先记录在页面内存中；需要检查时点击“生成投影”，点击“保存完整结果”会写入 Annotation、Mutiviews 和 Obj-O。");
+  if (!setInputCheckStatus()) {
+    setStatus("已加载。移动会先记录在页面内存中；需要检查时点击“生成投影”，点击“保存完整结果”会写入 Annotation、Mutiviews 和 Obj-O。");
+  }
 }
 
 function selectTarget(index) {
@@ -1401,7 +1534,12 @@ async function renderProjection(endpoint = "/api/render") {
     if (isSave) await refreshSamplesPreservingCurrent(data.annotation_path);
     finishStageToast(isSave ? "完整结果保存完成" : "投影生成完成");
     const savedPath = data.manual_output_info?.layout_dir || data.adjusted_json_path || "";
-    setStatus(isSave ? `已保存完整结果：${shortenMiddle(savedPath, 72)}` : "预览投影已生成，JSON 未写入。");
+    if (isSave) {
+      const checkText = operationCheckText("保存结果自检", data.save_check);
+      setStatus(`已保存完整结果：${shortenMiddle(savedPath, 72)}；${checkText}`, data.save_check?.summary?.status === "error");
+    } else {
+      setStatus("预览投影已生成，JSON 未写入。");
+    }
   } catch (error) {
     finishStageToast(error.message || String(error), true);
     setStatus(error.message || String(error), true);
@@ -1453,7 +1591,9 @@ async function importReviewRecords(file) {
     const state = await getJson("/api/state");
     renderState(state);
     finishStageToast(`审核文件导入完成：合并 ${result.merged} 个样本`);
-    setStatus(`已导入审核文件，合并 ${result.merged} 个重复样本，跳过 ${result.skipped} 个。`);
+    const checkText = operationCheckText("审核文件字段自检", result.review_check);
+    const historyText = result.history?.dir ? `；归档：${shortenMiddle(result.history.dir, 72)}` : "";
+    setStatus(`${checkText}；已导入审核文件，合并 ${result.merged} 个重复样本，跳过 ${result.skipped} 个${historyText}。`, result.review_check?.summary?.status === "error");
   } catch (error) {
     finishStageToast(error.message || String(error), true);
     setStatus(error.message || String(error), true);
@@ -1494,6 +1634,7 @@ function initEvents() {
     if (event.key === "Escape" && !$("mediaModal")?.hidden) closeMediaModal();
   });
   $("refreshSamples").addEventListener("click", () => refreshSamples({ autoLoad: true }));
+  $("refreshLogBtn")?.addEventListener("click", refreshBackendLog);
   $("sampleStatusFilter")?.addEventListener("change", applySampleFilters);
   $("sampleRatingFilter")?.addEventListener("change", applySampleFilters);
   $("sampleSelect").addEventListener("change", async (event) => {
@@ -1575,6 +1716,7 @@ async function init() {
   bindPathInputs();
   addFullscreenButtons();
   initEvents();
+  startBackendLogPolling();
   try {
     const defaults = await getJson("/api/defaults");
     setPathInputValue("datasetRoot", defaults.dataset_root || "");

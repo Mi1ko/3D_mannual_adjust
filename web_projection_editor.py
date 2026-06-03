@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-import json
 import io
+import json
+import logging
 import mimetypes
 import re
 import threading
@@ -21,6 +22,7 @@ from PIL import Image, ImageDraw
 APP_ROOT = Path(__file__).resolve().parent
 STATIC_ROOT = APP_ROOT / "web_static"
 PROJECT_ROOT = APP_ROOT.parents[1]
+APP_LOG_PATH = APP_ROOT / "manual_adjust_app.log"
 
 from camera import build_multiview_camera
 from projection import camera_to_world, project_world_to_pixels, to_list, world_to_camera
@@ -41,6 +43,7 @@ DATA_ADMIN_ROOT = DATA_ROOT / "admin"
 DATA_ADMIN_PENDING_ROOT = DATA_ADMIN_ROOT / "pending"
 DATA_ADMIN_REVIEW_ROOT = DATA_ADMIN_ROOT / "review_results"
 DATA_EXPORT_ROOT = DATA_ROOT / "export"
+DATA_REVIEW_HISTORY_ROOT = DATA_ROOT / "review_history"
 
 
 def configured_path(name: str, default: Path) -> Path:
@@ -49,6 +52,7 @@ def configured_path(name: str, default: Path) -> Path:
 
 
 REFERENCE_DATASET_ROOT = configured_path("REFERENCE_DATASET_ROOT", DATA_ROOT / "reference_3dlpd")
+ADMIN_INPUT_ROOT = configured_path("ADMIN_INPUT_ROOT", DATA_INPUT_ROOT)
 DEFAULT_DATASET_ROOT = DATA_INPUT_ROOT
 DEFAULT_OUTPUT_ROOT = DATA_OUTPUT_ROOT
 DEFAULT_PORT = 8780
@@ -73,6 +77,87 @@ STATE: dict = {
     "loaded_from_output": False,
 }
 SNAP_MESH_CACHE: dict[str, tuple[np.ndarray, dict[str, list[list[int]]]]] = {}
+
+LOGGER = logging.getLogger("manual_adjust_app")
+LOGGER.setLevel(logging.DEBUG)
+LOGGER.propagate = False
+if not LOGGER.handlers:
+    APP_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    log_handler = logging.FileHandler(APP_LOG_PATH, mode="a", encoding="utf-8")
+    log_handler.setLevel(logging.DEBUG)
+    log_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s [%(threadName)s] %(message)s"))
+    LOGGER.addHandler(log_handler)
+
+
+def log_value(value: object) -> object:
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, dict):
+        return {str(key): log_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [log_value(item) for item in value]
+    return value
+
+
+def log_event(event: str, **fields: object) -> None:
+    payload = {key: log_value(value) for key, value in fields.items() if value is not None}
+    try:
+        LOGGER.info("%s %s", event, json.dumps(payload, ensure_ascii=False, default=str))
+    except Exception:
+        LOGGER.info("%s %s", event, payload)
+
+
+def log_exception(event: str, exc: Exception, **fields: object) -> None:
+    payload = {key: log_value(value) for key, value in fields.items() if value is not None}
+    payload["error"] = str(exc)
+    try:
+        LOGGER.exception("%s %s", event, json.dumps(payload, ensure_ascii=False, default=str))
+    except Exception:
+        LOGGER.exception("%s %s", event, payload)
+
+
+def issue_log_preview(issues: list[dict], limit: int = 6) -> list[dict]:
+    preview = []
+    for issue in issues[:limit]:
+        if not isinstance(issue, dict):
+            continue
+        preview.append(
+            {
+                "level": issue.get("level"),
+                "code": issue.get("code") or issue.get("title"),
+                "message": issue.get("message") or issue.get("detail") or issue.get("title"),
+                "path": issue.get("path"),
+            }
+        )
+    return preview
+
+
+def check_log_summary(check: dict | None) -> dict:
+    if not isinstance(check, dict):
+        return {}
+    issues = check.get("issues") if isinstance(check.get("issues"), list) else []
+    return {
+        "summary": check.get("summary") or check,
+        "issue_count": len(issues),
+        "issue_preview": issue_log_preview(issues),
+    }
+
+
+def tail_log_lines(max_lines: int = 160, max_bytes: int = 256 * 1024) -> list[str]:
+    max_lines = max(20, min(int(max_lines or 160), 500))
+    max_bytes = max(4096, min(int(max_bytes or 0), 1024 * 1024))
+    if not APP_LOG_PATH.is_file():
+        return []
+    with APP_LOG_PATH.open("rb") as handle:
+        handle.seek(0, io.SEEK_END)
+        size = handle.tell()
+        start = max(0, size - max_bytes)
+        handle.seek(start)
+        data = handle.read()
+    lines = data.splitlines()
+    if start > 0 and lines:
+        lines = lines[1:]
+    return [line.decode("utf-8", errors="replace") for line in lines[-max_lines:]]
 
 
 def current_editor_name(annotation: dict) -> str:
@@ -454,6 +539,33 @@ def validation_issue(level: str, title: str, detail: str = "", path: Path | str 
     }
 
 
+def check_issue(level: str, code: str, message: str, path: Path | str | None = None) -> dict:
+    return {
+        "level": level,
+        "code": code,
+        "message": message,
+        "path": str(path) if path else "",
+    }
+
+
+def issue_text(issue: dict) -> str:
+    message = str(issue.get("message") or issue.get("title") or issue.get("code") or "").strip()
+    detail = str(issue.get("detail") or "").strip()
+    path = str(issue.get("path") or "").strip()
+    parts = [part for part in (message, detail, path) if part]
+    return "：".join(parts)
+
+
+def input_check_summary(issues: list[dict]) -> dict:
+    errors = sum(1 for issue in issues if issue.get("level") == "error")
+    warnings = sum(1 for issue in issues if issue.get("level") == "warning")
+    if errors:
+        return {"status": "error", "label": f"{errors} 个错误，样本不可用"}
+    if warnings:
+        return {"status": "warning", "label": f"{warnings} 个警告，请确认"}
+    return {"status": "ok", "label": "可用"}
+
+
 def is_number_triplet(value: object) -> bool:
     if not isinstance(value, list) or len(value) != 3:
         return False
@@ -565,6 +677,19 @@ def validate_annotation_path_identity(annotation_path: Path, annotation: dict, c
     return category, sample_name
 
 
+def validate_input_annotation_path_identity(annotation_path: Path, annotation: dict, context: str = "Input Annotation") -> tuple[str, str]:
+    category, sample_name = validate_annotation_path_identity(annotation_path, annotation, context)
+    identity = path_layout_identity(annotation_path)
+    if identity is None:
+        raise ValueError(f"{context} 路径无法解析为 Layout/category/sample/layout/Annotation：{annotation_path}")
+    _, _, path_level = identity
+    if str(path_level).lower() != INPUT_LAYOUT_LEVEL.lower():
+        raise ValueError(
+            f"{context} 必须来自 {INPUT_LAYOUT_LEVEL}，当前路径为 {path_level}：{annotation_path}"
+        )
+    return category, sample_name
+
+
 def validate_obj_p_path_identity(obj_p_path: Path, category: str, sample_name: str) -> None:
     parts = [part for part in obj_p_path.parts if part]
     upper_parts = [part.upper() for part in parts]
@@ -651,6 +776,20 @@ def parse_obj_material_usage(path: Path) -> dict:
         "group_materials": group_materials,
         "used_materials": used_materials,
     }
+
+
+def obj_o_label_leader_missing_groups(usage: dict) -> list[str]:
+    object_names = {
+        str(name)
+        for name in usage.get("objects", [])
+        if str(name).startswith(("label_", "leader_"))
+    }
+    group_names = {
+        str(name)
+        for name in usage.get("groups", set())
+        if str(name).startswith(("label_", "leader_"))
+    }
+    return sorted(object_names - group_names)
 
 
 def choose_points_file(points_dir: Path) -> Path | None:
@@ -844,6 +983,17 @@ def validate_obj_o_material_consistency(layout_json: dict, obj_o_path: Path, mtl
         if match and match.group(1) != sample_name:
             issues.append(validation_issue("error", "Obj-O 来源样本 ID 不一致", f"OBJ 对象名为 {object_name}，当前样本应为 {sample_name}-P", obj_o_path))
             break
+
+    missing_label_groups = obj_o_label_leader_missing_groups(usage)
+    if missing_label_groups:
+        issues.append(
+            validation_issue(
+                "error",
+                "Obj-O label/leader 缺少对应 g 分组",
+                ", ".join(missing_label_groups[:12]),
+                obj_o_path,
+            )
+        )
 
     _, expected_group_materials = build_obj_o_materials(layout_json)
     target_groups = set(expected_group_materials)
@@ -1108,6 +1258,328 @@ def sample_obj_p_path(dataset_root: Path, category: str, sample_name: str) -> Pa
     return None
 
 
+REQUIRED_LAYOUT_TOP_FIELDS = {
+    "version",
+    "layout_level",
+    "layout_type",
+    "sample_id",
+    "category",
+    "hierarchy_file",
+    "normalization",
+    "groups",
+}
+REQUIRED_GROUP_FIELDS = {"group_id", "id", "ori_id", "source_objs", "target_g", "anchor", "label", "leader_line"}
+REQUIRED_LABEL_FIELDS = {"text", "box_size", "center"}
+REQUIRED_ANCHOR_FIELDS = {"point"}
+REQUIRED_LEADER_FIELDS = {"start", "bend_points", "end"}
+
+
+def validate_layout_basic_fields(annotation_path: Path, annotation: dict, expected_level: str, issues: list[dict], prefix: str = "Annotation") -> None:
+    missing = sorted(REQUIRED_LAYOUT_TOP_FIELDS - set(annotation))
+    if missing:
+        issues.append(check_issue("error", "layout.missing_top_fields", f"{prefix} 缺少顶层字段：{', '.join(missing)}", annotation_path))
+    try:
+        category, sample_name = validate_annotation_path_identity(annotation_path, annotation, prefix)
+    except Exception as exc:
+        issues.append(check_issue("error", "layout.identity_mismatch", str(exc), annotation_path))
+        category, sample_name = annotation_identity(annotation_path, annotation)
+    if annotation.get("category") != category or str(annotation.get("sample_id") or "") != sample_name:
+        issues.append(check_issue("error", "layout.identity_fields_invalid", f"{prefix} 的 category/sample_id 与路径不一致", annotation_path))
+    if annotation.get("layout_level") != expected_level:
+        issues.append(check_issue("error", "layout.level_mismatch", f"{prefix} layout_level={annotation.get('layout_level')}，期望 {expected_level}", annotation_path))
+    normalization = annotation.get("normalization")
+    if not isinstance(normalization, dict):
+        issues.append(check_issue("error", "layout.normalization_invalid", f"{prefix} normalization 必须是对象", annotation_path))
+    else:
+        for key in ("center_origin", "center_target"):
+            if not is_number_triplet(normalization.get(key)):
+                issues.append(check_issue("error", "layout.normalization_invalid", f"{prefix} normalization.{key} 必须是三维数字数组", annotation_path))
+        scale = normalization.get("scale")
+        if not isinstance(scale, (int, float)) or not np.isfinite(float(scale)) or float(scale) <= 0:
+            issues.append(check_issue("error", "layout.normalization_invalid", f"{prefix} normalization.scale 必须是正数", annotation_path))
+
+    groups = annotation.get("groups")
+    if not isinstance(groups, list) or not groups:
+        issues.append(check_issue("error", "layout.groups_invalid", f"{prefix} groups 必须是非空数组", annotation_path))
+        return
+    seen: set[str] = set()
+    for index, group in enumerate(groups):
+        if not isinstance(group, dict):
+            issues.append(check_issue("error", "layout.group_invalid", f"{prefix} 第 {index + 1} 个 group 不是对象", annotation_path))
+            continue
+        group_id = str(group.get("group_id") or f"#{index + 1}")
+        if group_id in seen:
+            issues.append(check_issue("error", "layout.duplicate_group_id", f"{prefix} group_id 重复：{group_id}", annotation_path))
+        seen.add(group_id)
+        missing_group = sorted(REQUIRED_GROUP_FIELDS - set(group))
+        if missing_group:
+            issues.append(check_issue("error", "layout.group_missing_fields", f"group {group_id} 缺少字段：{', '.join(missing_group)}", annotation_path))
+        label = group.get("label") or {}
+        anchor = group.get("anchor") or {}
+        leader = group.get("leader_line") or {}
+        if not isinstance(label, dict) or not isinstance(anchor, dict) or not isinstance(leader, dict):
+            issues.append(check_issue("error", "layout.group_struct_invalid", f"group {group_id} 的 label/anchor/leader_line 必须是对象", annotation_path))
+            continue
+        for name, payload, required in (
+            ("label", label, REQUIRED_LABEL_FIELDS),
+            ("anchor", anchor, REQUIRED_ANCHOR_FIELDS),
+            ("leader_line", leader, REQUIRED_LEADER_FIELDS),
+        ):
+            missing_inner = sorted(required - set(payload))
+            if missing_inner:
+                issues.append(check_issue("error", "layout.group_missing_fields", f"group {group_id}.{name} 缺少字段：{', '.join(missing_inner)}", annotation_path))
+        if not is_number_triplet(label.get("center")):
+            issues.append(check_issue("error", "layout.label_center_invalid", f"group {group_id} label.center 不是三维数字数组", annotation_path))
+        if not is_number_triplet(label.get("box_size")) or any(float(value) <= 0 for value in (label.get("box_size") or [])):
+            issues.append(check_issue("error", "layout.label_box_invalid", f"group {group_id} label.box_size 必须是正数三维数组", annotation_path))
+        if not is_number_triplet(anchor.get("point")):
+            issues.append(check_issue("error", "layout.anchor_invalid", f"group {group_id} anchor.point 不是三维数字数组", annotation_path))
+        if not isinstance(group.get("target_g"), list) or not group.get("target_g"):
+            issues.append(check_issue("error", "layout.target_g_missing", f"group {group_id} target_g 为空", annotation_path))
+        if not isinstance(group.get("source_objs"), list) or not group.get("source_objs"):
+            issues.append(check_issue("warning", "layout.source_objs_missing", f"group {group_id} source_objs 为空", annotation_path))
+        if is_number_triplet(anchor.get("point")) and is_number_triplet(leader.get("start")) and not close_value(anchor.get("point"), leader.get("start"), 1e-5):
+            issues.append(check_issue("warning", "layout.leader_start_mismatch", f"group {group_id} leader_line.start 与 anchor.point 不一致", annotation_path))
+        if is_number_triplet(label.get("center")) and is_number_triplet(leader.get("end")) and not close_value(label.get("center"), leader.get("end"), 1e-5):
+            issues.append(check_issue("warning", "layout.leader_end_mismatch", f"group {group_id} leader_line.end 与 label.center 不一致", annotation_path))
+
+
+def validate_input_sample_files(annotation_path: Path, output_root: Path | None = None) -> tuple[str, str, list[dict]]:
+    issues: list[dict] = []
+    annotation_path = Path(annotation_path).expanduser().resolve()
+    category = ""
+    sample_name = annotation_path.stem
+    annotation: dict = {}
+    if not annotation_path.is_file():
+        issues.append(check_issue("error", "input.annotation_missing", "Annotation JSON 不存在", annotation_path))
+        return category, sample_name, issues
+    try:
+        annotation = load_json(annotation_path)
+    except Exception as exc:
+        issues.append(check_issue("error", "input.annotation_parse_failed", f"Annotation JSON 无法解析：{exc}", annotation_path))
+        return category, sample_name, issues
+    if not isinstance(annotation, dict):
+        issues.append(check_issue("error", "input.annotation_invalid", "Annotation JSON 顶层必须是对象", annotation_path))
+        return category, sample_name, issues
+
+    category, sample_name = annotation_identity(annotation_path, annotation)
+    validate_layout_basic_fields(annotation_path, annotation, INPUT_LAYOUT_LEVEL, issues, "Input Annotation")
+    dataset_root = infer_dataset_root(annotation_path)
+
+    obj_path = sample_obj_p_path(dataset_root, category, sample_name)
+    if obj_path is None:
+        expected = dataset_root / "Obj-P" / category / sample_name / f"{sample_name}-P.obj"
+        issues.append(check_issue("error", "input.obj_p_missing", "Obj-P 文件不存在", expected))
+    else:
+        try:
+            validate_obj_p_path_identity(obj_path, category, sample_name)
+            bounds = obj_vertex_bounds(obj_path)
+            if bounds["count"] <= 0:
+                issues.append(check_issue("error", "input.obj_p_empty", "Obj-P 没有可用顶点", obj_path))
+        except Exception as exc:
+            issues.append(check_issue("error", "input.obj_p_invalid", f"Obj-P 无法使用：{exc}", obj_path))
+
+    text_info = text_objs_info(annotation_path, annotation, dataset_root, output_root, obj_path)
+    if not text_info.get("text_objs_dir"):
+        checked_dirs = text_info.get("checked_dirs") or [str(dataset_root / "Text_objs" / category / sample_name)]
+        checked_text = "；".join(str(path) for path in checked_dirs[:6])
+        issues.append(check_issue("error", "input.text_objs_missing", f"Text_objs/TEXT_OBJS 目录不存在，已检查：{checked_text}", checked_dirs[0]))
+    elif text_info.get("missing"):
+        issues.append(check_issue("error", "input.text_obj_missing", f"缺少文字 OBJ：{', '.join(text_info['missing'][:8])}", text_info.get("text_objs_dir")))
+
+    projection_images = resolve_projection_images(annotation, dataset_root, output_root or DEFAULT_OUTPUT_ROOT, category, sample_name, annotation_path)
+    missing_views = [view for view in (*VIEW_ORDER, "combined") if view not in projection_images]
+    if missing_views:
+        issues.append(check_issue("warning", "input.projection_missing", f"输入投影图缺失：{', '.join(missing_views)}", dataset_root / "Layout" / category / sample_name / INPUT_LAYOUT_LEVEL / "Mutiviews"))
+
+    obj_o_info = resolve_obj_o_sources(annotation_path, annotation, dataset_root, output_root or DEFAULT_OUTPUT_ROOT).get("input") or {}
+    missing_obj_views = [view for view in VIEW_ORDER if not (obj_o_info.get("exists_by_view") or {}).get(view)]
+    if missing_obj_views:
+        issues.append(check_issue("warning", "input.obj_o_missing", f"输入 Obj-O 缺失视角：{', '.join(missing_obj_views)}", obj_o_info.get("dir") or dataset_root))
+    if obj_o_info.get("exists") and not obj_o_info.get("mtl_path"):
+        issues.append(check_issue("warning", "input.obj_o_mtl_missing", "输入 Obj-O 缺少 MTL 文件", obj_o_info.get("dir") or dataset_root))
+    return category, sample_name, issues
+
+
+def dataset_check_summary(samples: list[dict]) -> dict:
+    problem_samples = [sample for sample in samples if sample.get("input_problem")]
+    error_samples = [sample for sample in problem_samples if (sample.get("input_check") or {}).get("summary", {}).get("status") == "error"]
+    warning_samples = [sample for sample in problem_samples if (sample.get("input_check") or {}).get("summary", {}).get("status") == "warning"]
+    details = []
+    for sample in problem_samples[:8]:
+        first_issue = next((issue for issue in sample.get("input_issues") or [] if issue.get("level") in {"error", "warning"}), None)
+        if first_issue:
+            details.append(f"{sample.get('display_name') or sample.get('name')}：{issue_text(first_issue)}")
+    if error_samples:
+        status = "error"
+        label = f"输入文件自检发现 {len(error_samples)} 个不可用样本"
+    elif warning_samples:
+        status = "warning"
+        label = f"输入文件自检发现 {len(warning_samples)} 个样本有警告"
+    else:
+        status = "ok"
+        label = "输入文件自检通过"
+    return {
+        "status": status,
+        "label": label,
+        "problem_count": len(problem_samples),
+        "error_count": len(error_samples),
+        "warning_count": len(warning_samples),
+        "details": details,
+    }
+
+
+def reviewed_record_field_issues(records: object) -> list[dict]:
+    issues: list[dict] = []
+    if not isinstance(records, dict):
+        return [check_issue("error", "review_file.invalid", "审核文件顶层必须是 JSON 对象")]
+    schema_version = records.get("schema_version")
+    if schema_version is not None and not isinstance(schema_version, int):
+        issues.append(check_issue("error", "review_file.schema_version_invalid", "schema_version 必须是整数"))
+    samples = records.get("samples")
+    if not isinstance(samples, dict):
+        issues.append(check_issue("error", "review_file.samples_invalid", "samples 必须是对象"))
+        return issues
+    if not samples:
+        issues.append(check_issue("warning", "review_file.samples_empty", "审核文件 samples 为空"))
+    for key, sample in samples.items():
+        key_text = str(key or "")
+        if not isinstance(sample, dict):
+            issues.append(check_issue("error", "review_file.sample_invalid", f"{key_text} 记录必须是对象"))
+            continue
+        category = str(sample.get("category") or "")
+        sample_id = str(sample.get("sample_id") or "")
+        expected_key = sample_key(category, sample_id)
+        if not category or not sample_id:
+            issues.append(check_issue("error", "review_file.identity_missing", f"{key_text} 缺少 category 或 sample_id"))
+        elif key_text != expected_key or sample.get("key") not in {None, "", expected_key}:
+            issues.append(check_issue("error", "review_file.identity_mismatch", f"{key_text} 与 category/sample_id 不一致，期望 {expected_key}"))
+        status = canonical_record_status(sample)
+        if status not in REVIEWED_STATUSES:
+            issues.append(check_issue("error", "review_file.status_invalid", f"{key_text} status 必须是 reviewed 或 changes_required"))
+        review = sample.get("review")
+        if not isinstance(review, dict):
+            issues.append(check_issue("error", "review_file.review_invalid", f"{key_text} review 必须是对象"))
+        else:
+            rating = str(review.get("rating") or "")
+            if rating not in REVIEW_RATINGS:
+                issues.append(check_issue("error", "review_file.review_rating_invalid", f"{key_text} review.rating 必须是 good/medium/bad"))
+            if not review.get("reviewed_at") or parse_iso(review.get("reviewed_at")) is None:
+                issues.append(check_issue("error", "review_file.reviewed_at_invalid", f"{key_text} review.reviewed_at 缺失或格式错误"))
+            for field in ("reviewer_name", "remark"):
+                if field in review and not isinstance(review.get(field), str):
+                    issues.append(check_issue("error", "review_file.review_field_invalid", f"{key_text} review.{field} 必须是字符串"))
+        try:
+            cycle = int(sample.get("review_cycle") or 0)
+            if cycle < 0:
+                raise ValueError
+        except Exception:
+            issues.append(check_issue("error", "review_file.review_cycle_invalid", f"{key_text} review_cycle 必须是非负整数"))
+        output_layout_dir = str(sample.get("output_layout_dir") or "")
+        if output_layout_dir and category and sample_id:
+            expected_output = f"Layout/{category}/{sample_id}/{OUTPUT_LAYOUT_LEVEL}"
+            if output_layout_dir.replace("\\", "/") != expected_output:
+                issues.append(check_issue("error", "review_file.output_layout_dir_invalid", f"{key_text} output_layout_dir 应为 {expected_output}"))
+        for field in ("adjusted_at",):
+            if sample.get(field) and parse_iso(sample.get(field)) is None:
+                issues.append(check_issue("error", "review_file.datetime_invalid", f"{key_text} {field} 时间格式错误"))
+        adjuster = sample.get("adjuster")
+        if adjuster is not None and not isinstance(adjuster, dict):
+            issues.append(check_issue("error", "review_file.adjuster_invalid", f"{key_text} adjuster 必须是对象"))
+        history = sample.get("history")
+        if history is not None:
+            if not isinstance(history, list):
+                issues.append(check_issue("error", "review_file.history_invalid", f"{key_text} history 必须是数组"))
+            else:
+                for index, item in enumerate(history[:20]):
+                    if not isinstance(item, dict):
+                        issues.append(check_issue("error", "review_file.history_item_invalid", f"{key_text} history[{index}] 必须是对象"))
+                        continue
+                    if item.get("at") and parse_iso(item.get("at")) is None:
+                        issues.append(check_issue("error", "review_file.history_time_invalid", f"{key_text} history[{index}].at 时间格式错误"))
+    return issues
+
+
+def fail_on_error_issues(issues: list[dict], prefix: str) -> None:
+    errors = [issue for issue in issues if issue.get("level") == "error"]
+    if errors:
+        detail = "；".join(issue_text(issue) for issue in errors[:8])
+        raise ValueError(f"{prefix}：{detail}")
+
+
+def validate_saved_output_result(payload: dict) -> list[dict]:
+    issues: list[dict] = []
+    if not payload.get("loaded"):
+        return [check_issue("error", "save.state_not_loaded", "保存后没有可用的页面状态")]
+    output_root = Path(payload.get("output_root") or DEFAULT_OUTPUT_ROOT).expanduser().resolve()
+    annotation_path = Path(payload.get("adjusted_json_path") or "")
+    category = ""
+    sample_name = ""
+    if not annotation_path.is_file():
+        issues.append(check_issue("error", "save.annotation_missing", "保存后的 Annotation JSON 不存在", annotation_path))
+    else:
+        try:
+            annotation = load_json(annotation_path)
+            category, sample_name = annotation_identity(annotation_path, annotation)
+            validate_layout_basic_fields(annotation_path, annotation, OUTPUT_LAYOUT_LEVEL, issues, "Output Annotation")
+            if annotation.get("version") != "after_mannual_adjust":
+                issues.append(check_issue("error", "save.version_invalid", "Output Annotation version 应为 after_mannual_adjust", annotation_path))
+            if annotation.get("layout_type") != "manual_adjusted":
+                issues.append(check_issue("error", "save.layout_type_invalid", "Output Annotation layout_type 应为 manual_adjusted", annotation_path))
+            if not str(annotation.get("name") or "").strip():
+                issues.append(check_issue("error", "save.name_missing", "Output Annotation 缺少微调者 name", annotation_path))
+        except Exception as exc:
+            issues.append(check_issue("error", "save.annotation_parse_failed", f"保存后的 Annotation 无法解析：{exc}", annotation_path))
+    if not category or not sample_name:
+        category = str((payload.get("current_record") or {}).get("category") or "")
+        sample_name = str((payload.get("current_record") or {}).get("sample_id") or "")
+    if category and sample_name:
+        output_info = manual_output_info(output_root, sample_name, category)
+        for missing in output_info.get("missing") or []:
+            issues.append(check_issue("error", "save.output_missing", "保存产物缺失", missing))
+        obj_o_dir = Path(output_info.get("obj_o_dir") or output_obj_o_dir(output_root, sample_name, OUTPUT_LAYOUT_LEVEL, category))
+        obj_o_info = obj_o_info_from_dir(obj_o_dir, sample_name)
+        missing_obj_views = [view for view in VIEW_ORDER if not (obj_o_info.get("exists_by_view") or {}).get(view)]
+        if missing_obj_views:
+            issues.append(check_issue("error", "save.obj_o_missing", f"保存后的 Obj-O 缺失视角：{', '.join(missing_obj_views)}", obj_o_dir))
+        if obj_o_info.get("exists") and not obj_o_info.get("mtl_path"):
+            issues.append(check_issue("error", "save.obj_o_mtl_missing", "保存后的 Obj-O 缺少 MTL", obj_o_dir))
+        if annotation_path.is_file() and obj_o_info.get("path") and obj_o_info.get("mtl_path"):
+            try:
+                validate_obj_o_material_consistency(load_json(annotation_path), Path(obj_o_info["path"]), Path(obj_o_info["mtl_path"]), sample_name, issues)
+            except Exception as exc:
+                issues.append(check_issue("error", "save.obj_o_check_failed", f"Obj-O 自检失败：{exc}", obj_o_info.get("path")))
+
+        records = load_records(output_root)
+        record = record_for_sample(records, category, sample_name)
+        key = sample_key(category, sample_name)
+        if not isinstance(record, dict):
+            issues.append(check_issue("error", "save.record_missing", f"manual_adjust_records.json 缺少 {key}", records_path(output_root)))
+        else:
+            if record.get("key") != key or record.get("category") != category or str(record.get("sample_id") or "") != sample_name:
+                issues.append(check_issue("error", "save.record_identity_mismatch", f"{key} 记录身份字段不一致", records_path(output_root)))
+            expected_output = f"Layout/{category}/{sample_name}/{OUTPUT_LAYOUT_LEVEL}"
+            if str(record.get("output_layout_dir") or "").replace("\\", "/") != expected_output:
+                issues.append(check_issue("error", "save.record_output_dir_mismatch", f"{key} output_layout_dir 应为 {expected_output}", records_path(output_root)))
+            input_identity = path_layout_identity(record.get("input_annotation_path"))
+            if input_identity is None:
+                issues.append(check_issue("error", "save.record_input_path_invalid", f"{key} input_annotation_path 必须指向 input/{INPUT_LAYOUT_LEVEL} Annotation", record.get("input_annotation_path")))
+            elif str(input_identity[2]).lower() != INPUT_LAYOUT_LEVEL.lower():
+                issues.append(check_issue("error", "save.record_input_path_level_invalid", f"{key} input_annotation_path 应为 {INPUT_LAYOUT_LEVEL}，当前为 {input_identity[2]}", record.get("input_annotation_path")))
+            elif (input_identity[0], input_identity[1]) != (category, sample_name):
+                issues.append(check_issue("error", "save.record_input_path_mismatch", f"{key} input_annotation_path 指向 {input_identity[0]}/{input_identity[1]}", record.get("input_annotation_path")))
+            if canonical_record_status(record) not in ADJUSTED_STATUSES:
+                issues.append(check_issue("error", "save.record_status_invalid", f"{key} 保存后状态应为 adjusted 或 pending_recheck", records_path(output_root)))
+            adjuster = record.get("adjuster")
+            if not isinstance(adjuster, dict) or not str(adjuster.get("name") or "").strip() or str(adjuster.get("rating") or "") not in RATING_LABELS:
+                issues.append(check_issue("error", "save.record_adjuster_invalid", f"{key} adjuster 字段缺失或不正确", records_path(output_root)))
+            if not record.get("adjusted_at") or parse_iso(record.get("adjusted_at")) is None:
+                issues.append(check_issue("error", "save.record_adjusted_at_invalid", f"{key} adjusted_at 缺失或格式错误", records_path(output_root)))
+            if not isinstance(record.get("history"), list) or not record.get("history"):
+                issues.append(check_issue("error", "save.record_history_invalid", f"{key} history 缺失", records_path(output_root)))
+    return issues
+
+
 def settings_from_annotation(annotation: dict) -> NewLayoutSettings:
     camera = annotation.get("camera") or {}
     projection = annotation.get("_projection") or {}
@@ -1275,6 +1747,13 @@ def sample_record_from_json(json_path: Path, output_root: Path | None = None, re
     output_info = manual_output_info(output_root or DEFAULT_OUTPUT_ROOT, sample, category)
     sample_record = record_for_sample(records or load_records(output_root or DEFAULT_OUTPUT_ROOT), category, sample)
     review = sample_record.get("review", {}) if sample_record else {}
+    try:
+        checked_category, checked_sample, input_issues = validate_input_sample_files(json_path, output_root or DEFAULT_OUTPUT_ROOT)
+        category = checked_category or category
+        sample = checked_sample or sample
+    except Exception as exc:
+        input_issues = [check_issue("error", "input.check_failed", f"输入样本自检失败：{exc}", json_path)]
+    check_summary = input_check_summary(input_issues)
     return {
         "name": sample,
         "display_name": display,
@@ -1291,6 +1770,9 @@ def sample_record_from_json(json_path: Path, output_root: Path | None = None, re
         "self_rating": sample_record.get("adjuster", {}).get("rating") if sample_record else "",
         "admin_rating": review.get("rating") if sample_record else "",
         "admin_rating_label": review_rating_label(review.get("rating")) if sample_record and review.get("rating") else "",
+        "input_check": {"summary": check_summary, "issues": input_issues},
+        "input_issues": input_issues,
+        "input_problem": check_summary.get("status") in {"error", "warning"},
     }
 
 
@@ -1328,7 +1810,27 @@ def list_annotation_samples(root: Path | str, output_root: Path | str | None = N
     root = Path(root).expanduser().resolve()
     resolved_output_root = Path(output_root).expanduser().resolve() if output_root else DEFAULT_OUTPUT_ROOT
     if not root.is_dir():
-        return {"root": str(root), "samples": [], "error": "root does not exist"}
+        issue = check_issue("error", "input.root_missing", "输入根目录不存在", root)
+        result = {
+            "root": str(root),
+            "samples": [],
+            "error": "root does not exist",
+            "input_check": {
+                "status": "error",
+                "label": "输入文件自检失败",
+                "problem_count": 0,
+                "error_count": 1,
+                "warning_count": 0,
+                "details": [issue_text(issue)],
+            },
+        }
+        log_event(
+            "samples.scan.failed",
+            root=root,
+            output_root=resolved_output_root,
+            input_check=result["input_check"],
+        )
+        return result
 
     seen: set[Path] = set()
     samples: list[dict] = []
@@ -1356,7 +1858,16 @@ def list_annotation_samples(root: Path | str, output_root: Path | str | None = N
         entry = categories.setdefault(category, {"name": category, "path": "", "count": 0, "samples": []})
         entry["samples"].append(sample)
         entry["count"] += 1
-    return {"root": str(root), "samples": samples, "categories": list(categories.values())}
+    result = {"root": str(root), "samples": samples, "categories": list(categories.values()), "input_check": dataset_check_summary(samples)}
+    log_event(
+        "samples.scan.completed",
+        root=root,
+        output_root=resolved_output_root,
+        sample_count=len(samples),
+        category_count=len(categories),
+        input_check=result["input_check"],
+    )
+    return result
 
 
 def candidate_obj_o_dirs(
@@ -1849,6 +2360,29 @@ def candidate_dataset_roots(
     return unique
 
 
+TEXT_OBJS_DIR_NAMES = ("Text_objs", "TEXT_OBJS", "text_objs", "Text_Objs")
+
+
+def text_objs_dir_candidates(
+    annotation_path: Path,
+    annotation: dict,
+    dataset_root: Path | None,
+    output_root: Path | None,
+    obj_p_path: Path | None,
+) -> list[Path]:
+    category, sample_name = annotation_identity(annotation_path, annotation)
+    candidates: list[Path] = []
+    seen: set[str] = set()
+    for root in candidate_dataset_roots(annotation_path, dataset_root, output_root, obj_p_path):
+        for dirname in TEXT_OBJS_DIR_NAMES:
+            candidate = root / dirname / category / sample_name
+            key = str(candidate).lower()
+            if key not in seen:
+                seen.add(key)
+                candidates.append(candidate)
+    return candidates
+
+
 def find_text_objs_dir(
     annotation_path: Path,
     annotation: dict,
@@ -1856,12 +2390,9 @@ def find_text_objs_dir(
     output_root: Path | None,
     obj_p_path: Path | None,
 ) -> Path | None:
-    category, sample_name = annotation_identity(annotation_path, annotation)
-    for root in candidate_dataset_roots(annotation_path, dataset_root, output_root, obj_p_path):
-        candidates = [root / "Text_objs" / category / sample_name]
-        for candidate in candidates:
-            if candidate.is_dir():
-                return candidate.resolve()
+    for candidate in text_objs_dir_candidates(annotation_path, annotation, dataset_root, output_root, obj_p_path):
+        if candidate.is_dir():
+            return candidate.resolve()
     return None
 
 
@@ -1891,6 +2422,7 @@ def text_objs_info(
     obj_p_path: Path | None,
 ) -> dict:
     text_objs_dir = find_text_objs_dir(annotation_path, annotation, dataset_root, output_root, obj_p_path)
+    checked_dirs = text_objs_dir_candidates(annotation_path, annotation, dataset_root, output_root, obj_p_path)
     missing: list[str] = []
     paths: dict[str, str] = {}
     for index, group in enumerate(annotation.get("groups", [])):
@@ -1903,6 +2435,7 @@ def text_objs_info(
     return {
         "available": text_objs_dir is not None and not missing,
         "text_objs_dir": str(text_objs_dir) if text_objs_dir else None,
+        "checked_dirs": [str(path) for path in checked_dirs],
         "missing": missing,
         "paths": paths,
     }
@@ -2315,7 +2848,7 @@ def load_annotation(
 ) -> dict:
     annotation_path = Path(annotation_json).expanduser().resolve()
     base_annotation = load_json(annotation_path)
-    base_category, base_sample = validate_annotation_path_identity(annotation_path, base_annotation, "Input Annotation")
+    base_category, base_sample = validate_input_annotation_path_identity(annotation_path, base_annotation, "Input Annotation")
     resolved_dataset_root = Path(dataset_root).expanduser().resolve() if dataset_root else infer_dataset_root(annotation_path)
     resolved_output_root = Path(output_root).expanduser().resolve() if output_root else DEFAULT_OUTPUT_ROOT
     source_annotation_path = annotation_path
@@ -2338,7 +2871,7 @@ def load_annotation(
     annotation.pop("annotator_name", None)
     resolved_obj_p = Path(obj_p_path).expanduser().resolve() if obj_p_path else infer_obj_p_path(annotation_path, annotation)
     adjusted_json_path = output_json_path(resolved_output_root, annotation_path, annotation)
-    model_cat, sample_name = validate_annotation_path_identity(annotation_path, annotation, "当前 Annotation")
+    model_cat, sample_name = validate_input_annotation_path_identity(annotation_path, annotation, "当前 Input Annotation")
     validate_obj_p_path_identity(resolved_obj_p, model_cat, sample_name)
     projection_images = resolve_projection_images(
         annotation,
@@ -2361,6 +2894,20 @@ def load_annotation(
         STATE["adjusted_json_path"] = adjusted_json_path
         STATE["source_annotation_path"] = source_annotation_path
         STATE["loaded_from_output"] = bool(start_from_output)
+    log_event(
+        "annotation.loaded",
+        category=model_cat,
+        sample=sample_name,
+        annotation_path=annotation_path,
+        source_annotation_path=source_annotation_path,
+        obj_p_path=resolved_obj_p,
+        dataset_root=resolved_dataset_root,
+        output_root=resolved_output_root,
+        adjusted_json_path=adjusted_json_path,
+        start_from_output=bool(start_from_output),
+        group_count=len(annotation.get("groups") or []),
+        projection_views=sorted(projection_images),
+    )
     return current_state_payload()
 
 
@@ -2374,6 +2921,14 @@ def load_sample(
     root = Path(dataset_root).expanduser().resolve()
     annotation_path = sample_json_path(root, category, sample_name)
     obj_p_path = sample_obj_p_path(root, category, sample_name)
+    log_event(
+        "sample.load.requested",
+        dataset_root=root,
+        category=category,
+        sample=sample_name,
+        output_root=output_root,
+        start_from_output=bool(start_from_output),
+    )
     return load_annotation(annotation_path, obj_p_path, root, output_root, start_from_output=start_from_output)
 
 
@@ -2506,6 +3061,19 @@ def render_current(write_json: bool = False) -> dict:
         STATE["annotation"] = annotation
         STATE["projection_images"] = paths
         STATE["part_overlay_images"] = part_overlay_paths
+    log_event(
+        "render.completed",
+        category=model_cat,
+        sample=sample_name,
+        write_json=bool(write_json),
+        annotation_path=annotation_path,
+        obj_p_path=obj_p_path,
+        output_root=output_root,
+        obj_o_dir=temp_obj_o_dir,
+        adjusted_json_path=adjusted_json_path if write_json else None,
+        projection_views=sorted(paths),
+        part_overlay_views=sorted(part_overlay_paths),
+    )
     return current_state_payload()
 
 
@@ -2519,7 +3087,8 @@ def update_adjustment_record(metadata: dict) -> Path:
     if annotation is None or annotation_path is None:
         raise ValueError("No annotation loaded.")
     editor_name = require_editor_name(annotation)
-    category, sample_name = annotation_identity(annotation_path, annotation)
+    category, sample_name = validate_input_annotation_path_identity(annotation_path, annotation, "保存记录 input_annotation_path")
+    input_annotation_path = Path(annotation_path).expanduser().resolve()
     records = load_records(output_root)
     key = sample_key(category, sample_name)
     samples = records.setdefault("samples", {})
@@ -2559,7 +3128,7 @@ def update_adjustment_record(metadata: dict) -> Path:
         "key": key,
         "category": category,
         "sample_id": sample_name,
-        "input_annotation_path": str(annotation_path),
+        "input_annotation_path": str(input_annotation_path),
         "output_layout_dir": output_layout.relative_to(Path(output_root).expanduser().resolve()).as_posix(),
         "status": next_status,
         "review_cycle": cycle,
@@ -2573,7 +3142,21 @@ def update_adjustment_record(metadata: dict) -> Path:
         "review": existing.get("review") or {},
         "history": history,
     }
-    return save_records(output_root, records)
+    saved_path = save_records(output_root, records)
+    log_event(
+        "adjustment.record.updated",
+        category=category,
+        sample=sample_name,
+        key=key,
+        status=next_status,
+        event=event,
+        review_cycle=cycle,
+        records_path=saved_path,
+        output_root=output_root,
+        editor_name=editor_name,
+        self_rating=rating,
+    )
+    return saved_path
 
 
 def save_current(metadata: dict | None = None) -> dict:
@@ -2583,6 +3166,25 @@ def save_current(metadata: dict | None = None) -> dict:
     update_adjustment_record(metadata or {})
     payload = current_state_payload()
     payload["anchor_snap_report"] = snap_report
+    save_issues = validate_saved_output_result(payload)
+    payload["save_check"] = {"summary": input_check_summary(save_issues), "issues": save_issues}
+    log_event(
+        "save.self_check.completed",
+        category=payload.get("category"),
+        sample=payload.get("sample_name"),
+        adjusted_json_path=payload.get("adjusted_json_path"),
+        output_root=payload.get("output_root"),
+        anchor_snap_report=snap_report,
+        save_check=check_log_summary(payload["save_check"]),
+    )
+    fail_on_error_issues(save_issues, "保存结果自检失败")
+    log_event(
+        "save.completed",
+        category=payload.get("category"),
+        sample=payload.get("sample_name"),
+        adjusted_json_path=payload.get("adjusted_json_path"),
+        output_root=payload.get("output_root"),
+    )
     return payload
 
 
@@ -2712,18 +3314,21 @@ def unique_export_path(filename: str) -> Path:
 def save_export_file(data: bytes, filename: str) -> dict:
     path = unique_export_path(filename)
     path.write_bytes(data)
-    return {
+    result = {
         "filename": path.name,
         "path": str(path.resolve()),
         "relative_path": path.relative_to(APP_ROOT).as_posix(),
         "size": len(data),
     }
+    log_event("export.file.saved", **result)
+    return result
 
 
 def export_output_zip_file(output_root: Path | str, name: str | None = None) -> dict:
     data, filename = build_output_export_zip(output_root, name)
     result = save_export_file(data, filename)
     result["kind"] = "zip"
+    log_event("export.zip.completed", output_root=Path(output_root).expanduser().resolve(), filename=result.get("filename"), size=result.get("size"))
     return result
 
 
@@ -2762,14 +3367,68 @@ def merge_history(local_history: list, imported_history: list) -> list:
     return result
 
 
-def merge_review_records(output_root: Path | str, imported_records: dict) -> dict:
+def unique_review_history_dir(output_root: Path) -> Path:
+    DATA_REVIEW_HISTORY_ROOT.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    output_name = safe_filename_stem(output_root.name, "output")
+    base = DATA_REVIEW_HISTORY_ROOT / f"{timestamp}_{output_name}"
+    candidate = base
+    counter = 2
+    while candidate.exists():
+        candidate = DATA_REVIEW_HISTORY_ROOT / f"{base.name}_{counter}"
+        counter += 1
+    candidate.mkdir(parents=True, exist_ok=False)
+    return candidate
+
+
+def save_review_import_history(output_root: Path, local_records: dict, imported_records: object) -> dict:
+    history_dir = unique_review_history_dir(output_root)
+    local_path = history_dir / "local_records_before_merge.json"
+    imported_path = history_dir / "imported_review_records.json"
+    metadata_path = history_dir / "metadata.json"
+    local_samples = local_records.get("samples") if isinstance(local_records.get("samples"), dict) else {}
+    imported_samples = imported_records.get("samples") if isinstance(imported_records, dict) and isinstance(imported_records.get("samples"), dict) else {}
+    metadata = {
+        "created_at": now_iso(),
+        "output_root": str(output_root),
+        "records_path": str(records_path(output_root)),
+        "local_sample_count": len(local_samples),
+        "imported_sample_count": len(imported_samples),
+    }
+    save_json(local_path, local_records)
+    save_json(imported_path, imported_records)
+    save_json(metadata_path, metadata)
+    result = {
+        "dir": str(history_dir),
+        "local_records_path": str(local_path),
+        "imported_records_path": str(imported_path),
+        "metadata_path": str(metadata_path),
+    }
+    log_event("review.import.history_saved", **metadata, history=result)
+    return result
+
+
+def merge_review_records(output_root: Path | str, imported_records: object) -> dict:
+    resolved_output_root = Path(output_root).expanduser().resolve()
+    local_before_merge = load_records(resolved_output_root)
+    history = save_review_import_history(resolved_output_root, deepcopy(local_before_merge), imported_records)
     if not isinstance(imported_records, dict):
         raise ValueError("Imported review records must be a JSON object.")
+    review_issues = reviewed_record_field_issues(imported_records)
+    review_check = {"summary": input_check_summary(review_issues), "issues": review_issues}
+    log_event(
+        "review.import.self_check.completed",
+        output_root=resolved_output_root,
+        history_dir=history.get("dir"),
+        sample_count=len(imported_records.get("samples") or {}) if isinstance(imported_records.get("samples"), dict) else None,
+        review_check=check_log_summary(review_check),
+    )
+    fail_on_error_issues(review_issues, "审核文件字段自检失败")
     imported_records = normalize_records_format(imported_records)
     imported_samples = imported_records.get("samples") or {}
     if not isinstance(imported_samples, dict):
         raise ValueError("Imported review records do not contain samples.")
-    local = load_records(output_root)
+    local = deepcopy(local_before_merge)
     local_samples = local.setdefault("samples", {})
     merged = 0
     skipped = 0
@@ -2797,8 +3456,25 @@ def merge_review_records(output_root: Path | str, imported_records: dict) -> dic
             local_sample["status"] = imported_status
         local_samples[key] = local_sample
         merged += 1
-    save_records(output_root, local)
-    return {"merged": merged, "skipped": skipped, "records_path": str(records_path(output_root))}
+    saved_path = save_records(resolved_output_root, local)
+    result = {
+        "merged": merged,
+        "skipped": skipped,
+        "records_path": str(records_path(resolved_output_root)),
+        "history": history,
+        "review_check": review_check,
+    }
+    log_event(
+        "review.import.completed",
+        output_root=resolved_output_root,
+        records_path=saved_path,
+        history_dir=history.get("dir"),
+        merged=merged,
+        skipped=skipped,
+        imported_sample_count=len(imported_samples),
+        review_check=check_log_summary(review_check),
+    )
+    return result
 
 
 def ensure_admin_roots() -> None:
@@ -2914,6 +3590,7 @@ def list_admin_submissions() -> dict:
         "root": str(DATA_ADMIN_ROOT),
         "pending_root": str(DATA_ADMIN_PENDING_ROOT),
         "review_root": str(DATA_ADMIN_REVIEW_ROOT),
+        "admin_input_root": str(Path(ADMIN_INPUT_ROOT).expanduser().resolve()),
         "submissions": submissions,
     }
 
@@ -2969,6 +3646,114 @@ def admin_sample_summaries(
     return summaries
 
 
+def admin_input_root_candidates() -> list[Path]:
+    roots: list[Path] = []
+    configured = Path(ADMIN_INPUT_ROOT).expanduser().resolve()
+    roots.append(configured)
+    if configured.is_dir():
+        for child in sorted(configured.iterdir(), key=lambda item: item.name.lower()):
+            if child.is_dir() and (child / "Layout").is_dir():
+                roots.append(child.resolve())
+    unique: list[Path] = []
+    seen: set[str] = set()
+    for root in roots:
+        key = str(root).lower()
+        if key not in seen:
+            seen.add(key)
+            unique.append(root)
+    return unique
+
+
+def record_input_root_name(sample: dict) -> str:
+    parts = [part for part in re.split(r"[\\/]+", str(sample.get("input_annotation_path") or "")) if part]
+    lowered = [part.lower() for part in parts]
+    try:
+        layout_index = lowered.index("layout")
+    except ValueError:
+        return ""
+    if layout_index <= 0:
+        return ""
+    return parts[layout_index - 1]
+
+
+def admin_input_annotation_candidates(sample: dict, category: str, sample_name: str) -> list[Path]:
+    candidates: list[Path] = []
+    raw_path = str(sample.get("input_annotation_path") or "").strip()
+    if raw_path:
+        candidates.append(Path(raw_path).expanduser())
+    root_name = record_input_root_name(sample)
+    if root_name:
+        candidates.append(Path(ADMIN_INPUT_ROOT).expanduser().resolve() / root_name / "Layout" / category / sample_name / INPUT_LAYOUT_LEVEL / "Annotation" / f"{sample_name}.json")
+    for root in admin_input_root_candidates():
+        candidates.append(sample_json_path(root, category, sample_name))
+    unique: list[Path] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        try:
+            resolved = candidate.resolve()
+        except OSError:
+            resolved = candidate
+        key = str(resolved).lower()
+        if key not in seen:
+            seen.add(key)
+            unique.append(resolved)
+    return unique
+
+
+def find_admin_input_annotation(sample: dict, category: str, sample_name: str) -> Path | None:
+    for candidate in admin_input_annotation_candidates(sample, category, sample_name):
+        if not candidate.is_file():
+            continue
+        try:
+            annotation = load_json(candidate)
+            validate_input_annotation_path_identity(candidate, annotation, "Admin input view Annotation")
+        except Exception:
+            continue
+        return candidate.resolve()
+    return None
+
+
+def admin_input_view_payload(sample: dict, category: str, sample_name: str) -> dict:
+    annotation_path = find_admin_input_annotation(sample, category, sample_name)
+    if annotation_path is None:
+        return {
+            "available": False,
+            "input_root": str(Path(ADMIN_INPUT_ROOT).expanduser().resolve()),
+            "message": "未找到匹配的原始 layout2 样本",
+            "checked_roots": [str(root) for root in admin_input_root_candidates()],
+        }
+    layout_path = annotation_path.parent.parent
+    mutiviews_dir = layout_path / "Mutiviews"
+    obj_o_dir = layout_path / "Obj-O"
+    images = {
+        view: str((mutiviews_dir / projection_filename(sample_name, view)).resolve())
+        for view in (*VIEW_ORDER, "combined")
+        if (mutiviews_dir / projection_filename(sample_name, view)).is_file()
+    }
+    obj_o_info = obj_o_info_from_dir(obj_o_dir, sample_name)
+    preview_camera = {}
+    preview_view_cameras = {}
+    try:
+        annotation = load_json(annotation_path)
+        apply_internal_camera(annotation)
+        preview_camera = camera_payload(annotation)
+        preview_view_cameras = projection_camera_payload(annotation)
+    except Exception:
+        pass
+    return {
+        "available": True,
+        "input_root": str(infer_dataset_root(annotation_path)),
+        "annotation_path": str(annotation_path),
+        "layout_path": str(layout_path),
+        "mutiviews_dir": str(mutiviews_dir),
+        "obj_o_dir": str(obj_o_dir),
+        "projection_images": images,
+        "obj_o_info": obj_o_info,
+        "camera": preview_camera,
+        "view_cameras": preview_view_cameras,
+    }
+
+
 def admin_sample_payload(
     submission_root: Path,
     index: int = 0,
@@ -2997,6 +3782,7 @@ def admin_sample_payload(
             "samples": [],
             "all_samples": all_summaries,
             "current": None,
+            "admin_input_root": str(Path(ADMIN_INPUT_ROOT).expanduser().resolve()),
             "index": 0,
             "total": 0,
             "overall_total": len(all_summaries),
@@ -3023,6 +3809,7 @@ def admin_sample_payload(
     }
     obj_o_info = obj_o_info_from_dir(obj_o_dir, sample_name)
     validation = validate_admin_sample(submission_root, summary["key"], sample, layout_path, obj_o_info)
+    input_view = admin_input_view_payload(sample, category, sample_name)
     preview_camera = {}
     preview_view_cameras = {}
     try:
@@ -3039,6 +3826,7 @@ def admin_sample_payload(
         "obj_o_dir": str(obj_o_dir),
         "projection_images": images,
         "obj_o_sources": {"output": obj_o_info},
+        "input_view": input_view,
         "camera": preview_camera,
         "view_cameras": preview_view_cameras,
         "adjuster": sample.get("adjuster") or {},
@@ -3056,6 +3844,7 @@ def admin_sample_payload(
             "review_path": str(admin_review_root_for_submission(submission_root)),
             "review_records_path": str(records_path(admin_review_root_for_submission(submission_root))),
         },
+        "admin_input_root": str(Path(ADMIN_INPUT_ROOT).expanduser().resolve()),
         "samples": summaries,
         "all_samples": all_summaries,
         "current": current,
@@ -3113,7 +3902,18 @@ def save_admin_review(submission_name: str, payload: dict) -> dict:
     sample["history"] = history
     review_records = load_records(review_root)
     review_records.setdefault("samples", {})[key] = sample
-    save_records(review_root, review_records)
+    saved_path = save_records(review_root, review_records)
+    log_event(
+        "admin.review.saved",
+        submission=submission_root.name,
+        sample_key=key,
+        rating=rating,
+        next_status=next_status,
+        previous_status=previous_status,
+        reviewer_name=reviewer_name,
+        review_cycle=cycle,
+        records_path=saved_path,
+    )
     return admin_sample_payload(
         submission_root,
         sample_key_value=key,
@@ -3135,6 +3935,7 @@ def export_admin_records_file(submission_name: str) -> dict:
     data, filename = admin_records_download(submission_name)
     result = save_export_file(data, filename)
     result["kind"] = "review_records"
+    log_event("admin.records.exported", submission=submission_name, filename=result.get("filename"), size=result.get("size"))
     return result
 
 
@@ -3150,6 +3951,12 @@ def json_response(handler: SimpleHTTPRequestHandler, payload: dict, status: int 
 class EditorHandler(SimpleHTTPRequestHandler):
     def log_message(self, format: str, *args) -> None:  # noqa: A003
         return
+
+    def send_error(self, code: int, message: str | None = None, explain: str | None = None) -> None:
+        path = urlparse(self.path).path
+        if path != "/api/logs":
+            log_event("http.error", method=self.command, path=path, code=code, message=message or "")
+        super().send_error(code, message, explain)
 
     def do_GET(self) -> None:  # noqa: N802
         parsed = urlparse(self.path)
@@ -3175,29 +3982,58 @@ class EditorHandler(SimpleHTTPRequestHandler):
                     "admin_root": str(DATA_ADMIN_ROOT),
                     "admin_pending_root": str(DATA_ADMIN_PENDING_ROOT),
                     "admin_review_root": str(DATA_ADMIN_REVIEW_ROOT),
+                    "review_history_root": str(DATA_REVIEW_HISTORY_ROOT),
                     "records_filename": RECORDS_FILENAME,
+                    "log_path": str(APP_LOG_PATH),
+                },
+            )
+            return
+        if parsed.path == "/api/logs":
+            query = parse_qs(parsed.query)
+            try:
+                line_count = int(query.get("lines", ["160"])[0] or 160)
+            except ValueError:
+                line_count = 160
+            json_response(
+                self,
+                {
+                    "path": str(APP_LOG_PATH),
+                    "updated_at": now_iso(),
+                    "lines": tail_log_lines(line_count),
                 },
             )
             return
         if parsed.path == "/api/samples":
-            query = parse_qs(parsed.query)
-            root_value = unquote(query.get("root", [str(DEFAULT_DATASET_ROOT)])[0]).strip()
-            output_root_value = unquote(query.get("output_root", [str(DEFAULT_OUTPUT_ROOT)])[0]).strip()
-            root = Path(root_value) if root_value else DEFAULT_DATASET_ROOT
-            output_root = Path(output_root_value) if output_root_value else DEFAULT_OUTPUT_ROOT
-            json_response(self, list_annotation_samples(root, output_root))
+            try:
+                query = parse_qs(parsed.query)
+                root_value = unquote(query.get("root", [str(DEFAULT_DATASET_ROOT)])[0]).strip()
+                output_root_value = unquote(query.get("output_root", [str(DEFAULT_OUTPUT_ROOT)])[0]).strip()
+                root = Path(root_value) if root_value else DEFAULT_DATASET_ROOT
+                output_root = Path(output_root_value) if output_root_value else DEFAULT_OUTPUT_ROOT
+                json_response(self, list_annotation_samples(root, output_root))
+            except Exception as exc:
+                log_exception("samples.scan.failed", exc, root=root_value if "root_value" in locals() else None)
+                json_response(self, {"error": str(exc)}, status=500)
             return
         if parsed.path == "/api/admin/submissions":
-            json_response(self, list_admin_submissions())
+            try:
+                json_response(self, list_admin_submissions())
+            except Exception as exc:
+                log_exception("admin.submissions.failed", exc)
+                json_response(self, {"error": str(exc)}, status=500)
             return
         if parsed.path == "/api/admin/sample":
-            query = parse_qs(parsed.query)
-            submission = unquote(query.get("submission", ["."])[0]).strip()
-            index = int(query.get("index", ["0"])[0] or 0)
-            key = unquote(query.get("key", [""])[0]).strip() or None
-            status_filter = unquote(query.get("status_filter", ["all"])[0]).strip() or "all"
-            review_mode = unquote(query.get("review_mode", ["view"])[0]).strip() or "view"
-            json_response(self, admin_sample_payload(admin_submission_root(submission), index, key, status_filter, review_mode))
+            try:
+                query = parse_qs(parsed.query)
+                submission = unquote(query.get("submission", ["."])[0]).strip()
+                index = int(query.get("index", ["0"])[0] or 0)
+                key = unquote(query.get("key", [""])[0]).strip() or None
+                status_filter = unquote(query.get("status_filter", ["all"])[0]).strip() or "all"
+                review_mode = unquote(query.get("review_mode", ["view"])[0]).strip() or "view"
+                json_response(self, admin_sample_payload(admin_submission_root(submission), index, key, status_filter, review_mode))
+            except Exception as exc:
+                log_exception("admin.sample.failed", exc, submission=submission if "submission" in locals() else None)
+                json_response(self, {"error": str(exc)}, status=500)
             return
         if parsed.path == "/api/admin/export_records":
             try:
@@ -3205,6 +4041,7 @@ class EditorHandler(SimpleHTTPRequestHandler):
                 submission = unquote(query.get("submission", ["."])[0]).strip()
                 json_response(self, export_admin_records_file(submission))
             except Exception as exc:
+                log_exception("admin.records.export.failed", exc, submission=submission)
                 json_response(self, {"error": str(exc)}, status=500)
             return
         if parsed.path == "/api/file":
@@ -3220,12 +4057,14 @@ class EditorHandler(SimpleHTTPRequestHandler):
                 output_root = Path(output_root_value) if output_root_value else DEFAULT_OUTPUT_ROOT
                 json_response(self, export_output_zip_file(output_root, name_value))
             except Exception as exc:
+                log_exception("export.zip.failed", exc, output_root=output_root_value if "output_root_value" in locals() else None)
                 json_response(self, {"error": str(exc)}, status=500)
             return
         self.send_error(404)
 
     def do_POST(self) -> None:  # noqa: N802
         parsed = urlparse(self.path)
+        payload = None
         try:
             payload = self.read_json()
             if parsed.path == "/api/load":
@@ -3280,6 +4119,7 @@ class EditorHandler(SimpleHTTPRequestHandler):
                 json_response(self, export_current_obj_o())
                 return
         except Exception as exc:
+            log_exception("http.post.failed", exc, path=parsed.path, payload_keys=sorted(payload) if isinstance(payload, dict) else None)
             json_response(self, {"error": str(exc)}, status=500)
             return
         self.send_error(404)
@@ -3324,6 +4164,15 @@ class EditorHandler(SimpleHTTPRequestHandler):
 
 def main() -> None:
     port = DEFAULT_PORT
+    log_event(
+        "server.starting",
+        port=port,
+        app_root=APP_ROOT,
+        log_path=APP_LOG_PATH,
+        dataset_root=DEFAULT_DATASET_ROOT,
+        output_root=DEFAULT_OUTPUT_ROOT,
+        temp_root=DATA_TEMP_ROOT,
+    )
 
     try:
         samples = list_annotation_samples(DEFAULT_DATASET_ROOT, DEFAULT_OUTPUT_ROOT).get("samples") or []
@@ -3343,9 +4192,11 @@ def main() -> None:
                 DEFAULT_OUTPUT_ROOT,
             )
     except Exception as exc:
+        log_exception("server.initial_load.failed", exc)
         print(f"Initial annotation load failed: {exc}", flush=True)
 
     server = ThreadingHTTPServer(("127.0.0.1", int(port)), EditorHandler)
+    log_event("server.started", url=f"http://127.0.0.1:{port}")
     print(f"manual projection editor: http://127.0.0.1:{port}", flush=True)
     server.serve_forever()
 

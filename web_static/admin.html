@@ -48,12 +48,17 @@
           <span>样本状态</span>
           <strong id="reviewStatusText">待微调</strong>
         </div>
+        <div class="admin-view-switch" role="group" aria-label="审核视图切换">
+          <button id="adminOutputViewBtn" class="secondary active" type="button">提交视图</button>
+          <button id="adminInputViewBtn" class="secondary" type="button">原始视图</button>
+        </div>
         <label class="admin-sample-jump">样本直达（全量）
           <select id="adminSampleSelect"></select>
         </label>
         <dl class="admin-meta-list">
           <div><dt>微调者</dt><dd id="adjusterName">-</dd></div>
           <div><dt>自评</dt><dd id="selfRatingText">-</dd></div>
+          <div><dt>原始目录</dt><dd id="adminInputPath">-</dd></div>
         </dl>
         <section class="admin-validation-panel" aria-labelledby="validationTitle">
           <header>

@@ -8,3 +8,7 @@ from pathlib import Path
 # the original 3DLPD dataset. Leave it pointing to an empty/nonexistent local
 # directory if you do not need that validation.
 REFERENCE_DATASET_ROOT = Path(r"D:\path\to\3DLPD")
+
+# Used by the admin page to locate each submitter's original input slice.
+# This directory may contain split folders such as split_01_A, split_01_B, ...
+ADMIN_INPUT_ROOT = Path(r"D:\path\to\3D_Datasets\task")

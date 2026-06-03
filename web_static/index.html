@@ -17,6 +17,7 @@
       <section class="panel">
         <div class="panel-title-row">
           <h2>数据</h2>
+          <span id="adjustNeededCount" class="adjust-needed-count">需修改 0/0</span>
           <button id="refreshSamples" class="secondary" type="button">刷新文件列表</button>
         </div>
         <label>输入根目录
@@ -108,6 +109,14 @@
           <label>图片宽 <input id="imageWidth" type="number" readonly /></label>
           <label>图片高 <input id="imageHeight" type="number" readonly /></label>
         </div>
+      </section>
+
+      <section class="panel log-panel">
+        <div class="panel-title-row">
+          <h2>日志</h2>
+          <button id="refreshLogBtn" class="secondary" type="button">刷新</button>
+        </div>
+        <pre id="backendLogBox" class="backend-log-box">等待日志</pre>
       </section>
     </aside>
 

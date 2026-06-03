@@ -4,7 +4,7 @@ __pycache__/
 data/
 
 local_config.py
-
+*.log
 .env
 .venv/
 venv/

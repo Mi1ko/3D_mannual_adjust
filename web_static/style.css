@@ -99,6 +99,16 @@ h3 {
   margin: 0;
 }
 
+.adjust-needed-count {
+  flex: 1;
+  min-width: 0;
+  color: var(--warn);
+  font-size: 12px;
+  font-weight: 800;
+  text-align: center;
+  white-space: nowrap;
+}
+
 .panel-title-row #refreshSamples {
   width: auto;
   min-width: 104px;
@@ -109,6 +119,36 @@ h3 {
   color: var(--accent-dark);
   font-size: 12px;
   white-space: nowrap;
+}
+
+.panel-title-row #refreshLogBtn {
+  width: auto;
+  min-width: 64px;
+  min-height: 30px;
+  padding: 5px 10px;
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.log-panel {
+  padding-bottom: 10px;
+}
+
+.backend-log-box {
+  min-height: 160px;
+  max-height: 260px;
+  overflow: auto;
+  margin: 0;
+  padding: 8px;
+  border: 1px solid var(--line-strong);
+  border-radius: 8px;
+  background: #111827;
+  color: #d1fae5;
+  font-family: Consolas, "Courier New", monospace;
+  font-size: 11px;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  word-break: break-word;
 }
 
 label {
@@ -1235,6 +1275,24 @@ body.admin-page {
 
 .admin-state-box strong {
   font-size: 15px;
+}
+
+.admin-view-switch {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 6px;
+}
+
+.admin-view-switch button {
+  min-height: 30px;
+  padding: 5px 8px;
+  font-size: 12px;
+}
+
+.admin-view-switch button.active {
+  border-color: #a8bff5;
+  background: var(--accent-soft);
+  color: var(--accent-dark);
 }
 
 .admin-sample-title {
