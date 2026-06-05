@@ -9,3 +9,4 @@ local_config.py
 .venv/
 venv/
 node_modules/
+.vscode/

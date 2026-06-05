@@ -3149,7 +3149,7 @@ def update_adjustment_record(metadata: dict) -> Path:
         sample=sample_name,
         key=key,
         status=next_status,
-        event=event,
+        record_event=event,
         review_cycle=cycle,
         records_path=saved_path,
         output_root=output_root,
