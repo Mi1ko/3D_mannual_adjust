@@ -44,6 +44,11 @@ DATA_ADMIN_PENDING_ROOT = DATA_ADMIN_ROOT / "pending"
 DATA_ADMIN_REVIEW_ROOT = DATA_ADMIN_ROOT / "review_results"
 DATA_EXPORT_ROOT = DATA_ROOT / "export"
 DATA_REVIEW_HISTORY_ROOT = DATA_ROOT / "review_history"
+STATIC_CONTENT_TYPES = {
+    ".js": "application/javascript; charset=utf-8",
+    ".mjs": "application/javascript; charset=utf-8",
+    ".wasm": "application/wasm",
+}
 
 
 def configured_path(name: str, default: Path) -> Path:
@@ -4141,7 +4146,7 @@ class EditorHandler(SimpleHTTPRequestHandler):
         if not path.is_file():
             self.send_error(404)
             return
-        content_type = mimetypes.guess_type(str(path))[0] or "application/octet-stream"
+        content_type = STATIC_CONTENT_TYPES.get(path.suffix.lower()) or mimetypes.guess_type(str(path))[0] or "application/octet-stream"
         data = path.read_bytes()
         self.send_response(200)
         self.send_header("Content-Type", content_type)
