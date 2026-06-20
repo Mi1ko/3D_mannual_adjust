@@ -224,11 +224,12 @@ function addFullscreenButtons() {
   });
 }
 
-function sampleOptionText(sample) {
+function sampleOptionText(sample, options = {}) {
   const suffixes = [];
   if (sample.review_status_label) suffixes.push(`（${sample.review_status_label}）`);
   if (sample.self_rating === "bad") suffixes.push("（自评差）");
   if (sampleHasInputProblem(sample)) suffixes.push("（有问题）");
+  if (options.filterMismatch) suffixes.push("（不符合当前筛选）");
   return `${sample.display_name || sample.name}${suffixes.join("")}`;
 }
 
@@ -362,16 +363,31 @@ function renderSampleOptions(preferredAnnotationPath = "") {
   if (!sampleSelect) return null;
   appState.sampleStatusFilter = statusFilterValue();
   appState.sampleRatingFilter = ratingFilterValue();
-  appState.samples = appState.allSamples.filter((sample) => sampleMatchesFilters(sample));
+  const filteredSamples = appState.allSamples.filter((sample) => sampleMatchesFilters(sample));
+  const preferredSample = preferredAnnotationPath
+    ? appState.allSamples.find((sample) => sample.annotation_path === preferredAnnotationPath)
+    : null;
+  const keepPreferredVisible = Boolean(
+    preferredSample &&
+      !filteredSamples.some((sample) => sample.annotation_path === preferredAnnotationPath) &&
+      !sampleMatchesFilters(preferredSample),
+  );
+  appState.samples = keepPreferredVisible ? [preferredSample, ...filteredSamples] : filteredSamples;
   updateAdjustNeededCount();
   sampleSelect.innerHTML = "";
   for (const sample of appState.samples) {
+    const filterMismatch = keepPreferredVisible && sample.annotation_path === preferredAnnotationPath;
     const option = document.createElement("option");
     option.value = sample.annotation_path;
-    option.textContent = sampleOptionText(sample);
+    option.textContent = sampleOptionText(sample, { filterMismatch });
     if (sampleHasInputProblem(sample)) {
       option.classList.add("problem");
       option.title = sampleProblemText(sample, 10);
+    }
+    if (filterMismatch) {
+      option.classList.add("filter-mismatch");
+      const hint = "当前样本不符合当前筛选条件，临时保留在列表中。";
+      option.title = option.title ? `${option.title}；${hint}` : hint;
     }
     sampleSelect.appendChild(option);
   }
@@ -1045,7 +1061,7 @@ function selectSample(annotationPath) {
   $("sampleTitle").textContent = appState.selectedSample.display_name || appState.selectedSample.name;
   updateLoadButtons();
   if (!setInputCheckStatus()) {
-    setStatus("已选择样本，可以从 input 加载；如已有微调结果，也可以从 output 加载。");
+    setStatus("已选择样本；如已有 output 微调结果会优先加载，必要时可点击“从 input 加载”。");
   }
 }
 
@@ -1389,7 +1405,8 @@ function renderState(data, options = {}) {
   refreshObjOPreview(data, Boolean(options.forceObjPreview));
   appState.dirty = false;
   if (!setInputCheckStatus()) {
-    setStatus("已加载。移动会先记录在页面内存中；需要检查时点击“生成投影”，点击“保存完整结果”会写入 Annotation、Mutiviews 和 Obj-O。");
+    const loadSourceText = data.loaded_from_output ? "已从 output 初始化加载" : "已从 input 加载";
+    setStatus(`${loadSourceText}。移动会先记录在页面内存中；需要检查时点击“生成投影”，点击“保存完整结果”会写入 Annotation、Mutiviews 和 Obj-O。`);
   }
 }
 
@@ -1484,7 +1501,7 @@ async function loadAnnotation(options = {}) {
     }
     showStageToast("正在加载样本...");
     window.clearObjOPreview?.();
-    const startFromOutput = Boolean(options.startFromOutput);
+    const startFromOutput = options.startFromOutput ?? Boolean(appState.selectedSample?.manual_output_complete);
     if (startFromOutput && !appState.selectedSample.manual_output_complete) {
       setStatus("当前样本还没有完整的 output 微调结果。", true);
       finishStageToast("当前样本还没有完整的 output 微调结果", true);
@@ -1641,7 +1658,7 @@ function initEvents() {
     selectSample(event.target.value);
     await loadAnnotation();
   });
-  $("loadBtn").addEventListener("click", loadAnnotation);
+  $("loadBtn").addEventListener("click", () => loadAnnotation({ startFromOutput: false }));
   $("loadAdjustedBtn")?.addEventListener("click", () => loadAnnotation({ startFromOutput: true }));
   $("undoBtn")?.addEventListener("click", undoPosition);
   $("redoBtn")?.addEventListener("click", redoPosition);

@@ -1261,11 +1261,18 @@ body.admin-page {
 }
 
 .admin-info-panel {
-  display: grid;
-  grid-template-rows: auto auto auto auto auto auto auto auto auto minmax(0, 1fr);
+  display: flex;
+  flex-direction: column;
   gap: 8px;
   padding: 10px;
-  overflow: hidden;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
+  touch-action: pan-y;
+}
+
+.admin-info-panel > * {
+  flex: 0 0 auto;
 }
 
 .admin-state-box {
@@ -1370,6 +1377,10 @@ body.admin-page {
   background: var(--surface-alt);
 }
 
+.admin-meta-list div:nth-child(3) {
+  grid-column: 1 / -1;
+}
+
 .admin-meta-list dt {
   color: var(--muted);
   font-size: 11px;
@@ -1380,6 +1391,16 @@ body.admin-page {
   margin: 2px 0 0;
   font-weight: 900;
   overflow-wrap: anywhere;
+}
+
+#adminInputPath {
+  display: block;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  overflow-wrap: normal;
+  font-size: 12px;
+  line-height: 1.35;
 }
 
 .admin-validation-panel {
@@ -1425,7 +1446,7 @@ body.admin-page {
 
 #validationList {
   min-height: 0;
-  max-height: 112px;
+  max-height: 160px;
   overflow: auto;
   display: grid;
   align-content: start;
@@ -1477,7 +1498,7 @@ body.admin-page {
 
 .admin-readonly-field p {
   min-height: 64px;
-  max-height: 112px;
+  max-height: 160px;
   overflow: auto;
   margin: 0;
   padding: 8px 9px;
@@ -1502,7 +1523,8 @@ body.admin-page {
 }
 
 .admin-history {
-  min-height: 0;
+  min-height: 72px;
+  max-height: 240px;
   overflow: auto;
   display: grid;
   align-content: start;
